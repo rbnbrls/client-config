@@ -1,0 +1,9 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "Configuration Schema API", "version": "1.0.0", "description": "Versieerbare parameterdefinities en niet-mutatieve configuratievalidatie."},
+  "paths": {
+    "/api/v1/config-schemas": {"get": {"summary": "Beschikbare configuratieschemaversies en parameterdefinities", "responses": {"200": {"description": "Schema-ID, versie, eigenaar, valid-time en transaction-time"}}}},
+    "/api/v1/config-schemas/{version}": {"get": {"summary": "Een specifieke configuratieschemaversie", "parameters": [{"name":"version","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"Onveranderlijke schema-inhoud en parameterdefinities"},"400":{"description":"Onbekende versie"}}}},
+    "/api/v1/configurations/validate": {"post": {"summary": "Valideer configuratie en leg hash/resultaat vast in audit", "requestBody": {"required":true,"content":{"application/json":{"schema":{"type":"object","required":["configuration","actor","reason"],"properties":{"configuration":{"type":"object"},"schema_version":{"type":"string"},"actor":{"type":"string","minLength":1},"reason":{"type":"string","minLength":1}}}}}},"responses":{"200":{"description":"Validatieresultaat met veldpaden en foutcodes; valid=false is een normale validatierespons"},"400":{"description":"Ongeldig request"}}}}
+  }
+}

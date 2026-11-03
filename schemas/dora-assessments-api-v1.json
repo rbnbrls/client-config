@@ -1,0 +1,18 @@
+{
+  "openapi": "3.1.0",
+  "info": {"title": "DORA Assessment Temporal Read API", "version": "1.0.0", "description": "Tijdreisquery voor menselijke DORA-scopebeoordelingen; geen automatische juridische conclusie."},
+  "paths": {
+    "/api/v1/dora-assessments": {
+      "get": {
+        "summary": "Beoordelingen zoals bekend op een tijdstip en geldig op een datum",
+        "parameters": [
+          {"name":"valid_at","in":"query","required":true,"schema":{"type":"string","format":"date"}},
+          {"name":"known_at","in":"query","required":true,"schema":{"type":"string","format":"date-time","description":"UTC ISO 8601"}},
+          {"name":"customer_id","in":"query","required":false,"schema":{"type":"string"}}
+        ],
+        "responses": {"200":{"description":"Beoordelingen, waaronder expliciet gemarkeerde legacy-items zonder bekende valid-time","content":{"application/json":{"schema":{"type":"array","items":{"$ref":"#/components/schemas/Assessment"}}}}},"400":{"description":"Ongeldige of ontbrekende tijdparameters"}}
+      }
+    }
+  },
+  "components": {"schemas":{"Assessment":{"type":"object","required":["id","version","created_at","review_date","validity_status"],"properties":{"id":{"type":"string"},"version":{"type":"integer"},"created_at":{"type":"string","format":"date-time"},"review_date":{"type":"string","format":"date","description":"Reviewdeadline; geen valid-time einddatum"},"effective_from":{"type":["string","null"],"format":"date"},"effective_to":{"type":["string","null"],"format":"date","description":"Exclusieve einddatum"},"validity_status":{"type":"string","enum":["valid","unset_legacy","dated"]},"applicability":{"type":"string","enum":["pending_review","in_scope","out_of_scope"]},"criticality":{"type":"string","enum":["unassessed","critical_important","other"]}}}}}
+}

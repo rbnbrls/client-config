@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "configuration-v1.json",
+  "x-version": 1,
+  "x-effective-from": "2026-01-01",
+  "x-owner": "Client Service domeineigenaar (roltoewijzing te valideren)",
+  "title": "Klantbedieningsconfiguratie",
+  "description": "Synthetische prototypeconfiguratie; klantnormen en beleid blijven klantspecifiek.",
+  "type": "object",
+  "required": ["legal_entities", "services", "mandate", "fees", "sla", "reporting", "evidence"],
+  "properties": {
+    "legal_entities": {"type":"array","items":{"type":"object","required":["name","role"],"properties":{"name":{"type":"string","minLength":1},"role":{"type":"string","minLength":1}}}},
+    "services": {"type":"array","items":{"type":"object","required":["code","status"],"properties":{"code":{"type":"string","minLength":1,"x-owner":"Servicecataloguseigenaar"},"name":{"type":"string"},"status":{"type":"string","enum":["active","inactive","planned"]}}}},
+    "mandate": {"type":"object","required":["benchmark","currency"],"properties":{"name":{"type":"string"},"benchmark":{"type":"string","minLength":1,"x-owner":"Mandaat-eigenaar"},"currency":{"type":"string","pattern":"^[A-Z]{3}$","x-unit":"ISO 4217-code","x-owner":"Mandaat-eigenaar"},"delegation":{"type":"string"}}},
+    "fees": {"type":"object","required":["type","bps"],"properties":{"type":{"type":"string","enum":["aum_bps"],"x-owner":"Fee-eigenaar"},"bps":{"type":"number","minimum":0,"maximum":1000,"x-unit":"bps","x-owner":"Fee-eigenaar","x-evidence-required":true},"minimum_eur":{"type":"number","minimum":0,"x-unit":"EUR","x-owner":"Fee-eigenaar","x-dependencies":["mandate.currency"]},"frequency":{"type":"string","enum":["monthly","quarterly","annually"],"x-owner":"Fee-eigenaar"}}},
+    "sla": {"type":"object","required":["target_percent"],"properties":{"metric":{"type":"string"},"target_percent":{"type":"number","minimum":0,"maximum":100,"x-unit":"percent","x-owner":"SLA-eigenaar","x-evidence-required":true},"period":{"type":"string"}}},
+    "reporting": {"type":"object","properties":{"frequency":{"type":"string","enum":["monthly","quarterly","annually"],"x-owner":"Rapportage-eigenaar"},"deadline_business_days":{"type":"integer","minimum":0,"maximum":365,"x-unit":"business days","x-owner":"Rapportage-eigenaar"},"language":{"type":"string","pattern":"^[a-z]{2}$"},"recipients":{"type":"array","items":{"type":"string"}}}},
+    "governance": {"type":"object"},
+    "restrictions": {"type":"array","items":{"type":"string"}},
+    "evidence": {"type":"array","minItems":1,"items":{"type":"object","required":["reference"],"properties":{"type":{"type":"string"},"reference":{"type":"string","minLength":1},"status":{"type":"string"}}}}
+  }
+}

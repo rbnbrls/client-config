@@ -1,0 +1,36 @@
+# Lokale projectplanning: niet publiceren naar GitHub
+/docs/PROJECT-PLAN.md
+
+# Lokale SQLite-database en tijdelijke journal-/WAL-bestanden
+/data/*.db
+/data/*.db-journal
+/data/*.db-wal
+/data/*.db-shm
+
+# Python bytecode en lokale virtuele omgevingen
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Lokale instellingen en geheimen
+.env
+.env.*
+!.env.example
+
+# Test-, coverage- en buildoutput
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# OS- en editorbestanden
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

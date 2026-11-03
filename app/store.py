@@ -1,0 +1,631 @@
+"""SQLite persistence, temporal reads, workflow, simulation and exports."""
+import hashlib, json, os, re, sqlite3, uuid
+from datetime import date, datetime, timezone
+from pathlib import Path
+from .domain import fee_delta
+from . import config_schema
+
+ROOT = Path(__file__).resolve().parents[1]
+DB_PATH = Path(os.environ.get("CLIENT_CONFIG_DB", ROOT / "data" / "client_config.db"))
+def now(): return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+def connect():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    db=sqlite3.connect(DB_PATH); db.row_factory=sqlite3.Row; db.execute("PRAGMA foreign_keys=ON"); return db
+
+def seed(db):
+    stamp=now()
+    customers=[("northstar","Northstar Pensioenfonds (synthetisch)","Pensioenfonds"),("harbor","Harbor Verzekeringen (synthetisch)","Verzekeraar"),("meridian","Meridian Bank (synthetisch)","Bank")]
+    for cid,name,kind in customers:
+        db.execute("INSERT INTO customers VALUES(?,?,?,?,?,?)",(cid,name,kind,"NL","Professioneel",stamp))
+        payload={"legal_entities":[{"name":name,"role":"client"}],"services":[{"code":"FIDUCIARY","name":"Fiduciair management","status":"active"},{"code":"RISK","name":"Risicomanagement","status":"active"}],"mandate":{"name":"Strategisch mandaat","benchmark":"Synthetic Global 60/40","currency":"EUR","delegation":"Advisory"},"fees":{"type":"aum_bps","bps":18 if cid=="northstar" else 16,"minimum_eur":45000,"frequency":"quarterly"},"sla":{"metric":"rapportage_tijdigheid","target_percent":98,"period":"quarterly"},"reporting":{"frequency":"quarterly","deadline_business_days":10,"language":"nl","recipients":["synthetic.contact@example.invalid"]},"governance":{"committee":"Beleggingscommissie","escalation":"Client lead → Risk"},"restrictions":["Synthetisch voorbeeld; geen echte restrictie"],"evidence":[{"type":"contract","reference":"SYNTHETIC-CONTRACT-001","status":"example only"}]}
+        schema_version=str(config_schema.latest_schema(datetime.now(timezone.utc).date().isoformat())["x-version"])
+        errors=config_schema.validate(payload,config_schema.get_schema(schema_version))
+        if errors: raise ValueError(f"Seedconfiguratie voldoet niet aan schema v{schema_version}: {errors}")
+        db.execute("INSERT INTO config_versions(id,customer_id,version,valid_from,valid_to,recorded_from,recorded_to,payload,change_id,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),cid,1,"2026-01-01",None,stamp,None,json.dumps(payload),None,schema_version))
+    db.execute("INSERT OR IGNORE INTO partner_profiles VALUES(?,?,?,?)",("generic-asp","Generieke Asset Service Provider","1.0",json.dumps({"customer":"customer","services":"service_catalog","mandate":"mandate","fee_terms":"fees","reporting":"reporting","sla":"sla"})))
+
+def init():
+    with connect() as db:
+        db.executescript('''CREATE TABLE IF NOT EXISTS customers(id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,jurisdiction TEXT NOT NULL,classification TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS config_versions(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL REFERENCES customers(id),version INTEGER NOT NULL,valid_from TEXT NOT NULL,valid_to TEXT,recorded_from TEXT NOT NULL,recorded_to TEXT,payload TEXT NOT NULL,change_id TEXT,schema_version TEXT NOT NULL DEFAULT '1',UNIQUE(customer_id,version));
+        CREATE INDEX IF NOT EXISTS config_asof ON config_versions(customer_id,valid_from,valid_to,recorded_from,recorded_to);
+        CREATE TABLE IF NOT EXISTS config_knowledge_snapshots(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL REFERENCES customers(id),revision INTEGER NOT NULL,recorded_at TEXT NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,timeline TEXT NOT NULL,UNIQUE(customer_id,revision));
+        CREATE INDEX IF NOT EXISTS config_knowledge_asof ON config_knowledge_snapshots(customer_id,recorded_at,revision);
+        CREATE TRIGGER IF NOT EXISTS config_knowledge_no_update BEFORE UPDATE ON config_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'config knowledge snapshots are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS config_knowledge_no_delete BEFORE DELETE ON config_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'config knowledge snapshots are append-only'); END;
+        CREATE TABLE IF NOT EXISTS change_sets(id TEXT PRIMARY KEY,title TEXT NOT NULL,customer_id TEXT NOT NULL REFERENCES customers(id),base_version INTEGER NOT NULL,patch TEXT NOT NULL,effective_date TEXT NOT NULL,rationale TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,simulation TEXT,approved_by TEXT,approved_at TEXT,activated_at TEXT,schema_version TEXT NOT NULL DEFAULT '1');
+        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,details TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS partner_profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,schema_version TEXT NOT NULL,mapping TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,config_version INTEGER NOT NULL,profile_id TEXT NOT NULL,schema_version TEXT NOT NULL,checksum TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS config_schema_versions(version INTEGER PRIMARY KEY,schema_id TEXT NOT NULL,title TEXT NOT NULL,owner TEXT NOT NULL,effective_from TEXT NOT NULL,recorded_at TEXT NOT NULL,schema_json TEXT NOT NULL,created_by TEXT NOT NULL,rationale TEXT NOT NULL);
+        CREATE TRIGGER IF NOT EXISTS config_schema_no_update BEFORE UPDATE ON config_schema_versions BEGIN SELECT RAISE(ABORT,'configuration schemas are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS config_schema_no_delete BEFORE DELETE ON config_schema_versions BEGIN SELECT RAISE(ABORT,'configuration schemas are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS policy_controls(
+          id TEXT PRIMARY KEY, control_code TEXT NOT NULL, version INTEGER NOT NULL,
+          title TEXT NOT NULL, owner TEXT NOT NULL, audience TEXT NOT NULL,
+          source_ref TEXT NOT NULL, applicability TEXT NOT NULL, enforcement TEXT NOT NULL,
+          effective_date TEXT NOT NULL, review_date TEXT NOT NULL,
+          validation_status TEXT NOT NULL, validation_evidence TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, change_note TEXT NOT NULL,
+          UNIQUE(control_code,version));
+          CREATE INDEX IF NOT EXISTS policy_code_version ON policy_controls(control_code,version);
+          CREATE TRIGGER IF NOT EXISTS policy_controls_no_update BEFORE UPDATE ON policy_controls BEGIN SELECT RAISE(ABORT,'policy controls are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS policy_controls_no_delete BEFORE DELETE ON policy_controls BEGIN SELECT RAISE(ABORT,'policy controls are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS policy_source_reviews(
+          id TEXT PRIMARY KEY, control_code TEXT NOT NULL, policy_version INTEGER NOT NULL,
+          source_kind TEXT NOT NULL, source_title TEXT NOT NULL, source_locator TEXT NOT NULL,
+          outcome TEXT NOT NULL, reviewer TEXT NOT NULL, reviewer_role TEXT NOT NULL,
+          rationale TEXT NOT NULL, checked_at TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS policy_source_review_version ON policy_source_reviews(control_code,policy_version,checked_at);
+          CREATE TABLE IF NOT EXISTS policy_decisions(
+          id TEXT PRIMARY KEY, control_code TEXT NOT NULL, policy_version INTEGER NOT NULL,
+          source_review_id TEXT, decision TEXT NOT NULL, reviewer TEXT NOT NULL,
+          reviewer_role TEXT NOT NULL, rationale TEXT NOT NULL, decided_at TEXT NOT NULL);
+          CREATE INDEX IF NOT EXISTS policy_decision_version ON policy_decisions(control_code,policy_version,decided_at);
+          CREATE TRIGGER IF NOT EXISTS policy_source_reviews_no_update BEFORE UPDATE ON policy_source_reviews BEGIN SELECT RAISE(ABORT,'policy source reviews are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS policy_source_reviews_no_delete BEFORE DELETE ON policy_source_reviews BEGIN SELECT RAISE(ABORT,'policy source reviews are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS policy_decisions_no_update BEFORE UPDATE ON policy_decisions BEGIN SELECT RAISE(ABORT,'policy decisions are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS policy_decisions_no_delete BEFORE DELETE ON policy_decisions BEGIN SELECT RAISE(ABORT,'policy decisions are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS client_requirements(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          category TEXT NOT NULL, title TEXT NOT NULL, requirement TEXT NOT NULL,
+          source_ref TEXT NOT NULL, config_path TEXT, expected_value TEXT,
+          frequency TEXT NOT NULL, effective_date TEXT NOT NULL, review_date TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, rationale TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS client_requirement_customer ON client_requirements(customer_id,id,version);''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS dora_assessments(
+          id TEXT NOT NULL, version INTEGER NOT NULL, assessment_type TEXT NOT NULL,
+          customer_id TEXT REFERENCES customers(id), counterparty TEXT NOT NULL,
+          service_name TEXT NOT NULL, scope_description TEXT NOT NULL,
+          applicability TEXT NOT NULL, criticality TEXT NOT NULL, contract_ref TEXT NOT NULL,
+          source_ref TEXT NOT NULL, reviewer TEXT NOT NULL, reviewer_role TEXT NOT NULL,
+          rationale TEXT NOT NULL, review_date TEXT NOT NULL, created_at TEXT NOT NULL,
+          effective_from TEXT, effective_to TEXT, PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS dora_assessment_latest ON dora_assessments(id,version);
+          CREATE TRIGGER IF NOT EXISTS dora_assessment_no_update BEFORE UPDATE ON dora_assessments BEGIN SELECT RAISE(ABORT,'DORA assessments are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS dora_assessment_no_delete BEFORE DELETE ON dora_assessments BEGIN SELECT RAISE(ABORT,'DORA assessments are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS client_entities(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          entity_type TEXT NOT NULL, name TEXT NOT NULL, legal_identifier TEXT NOT NULL,
+          jurisdiction TEXT NOT NULL, classification TEXT NOT NULL, effective_from TEXT NOT NULL,
+          effective_to TEXT, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS client_entity_latest ON client_entities(customer_id,id,version);
+          CREATE TABLE IF NOT EXISTS client_relationships(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          from_entity_id TEXT NOT NULL, to_entity_id TEXT NOT NULL, relationship_type TEXT NOT NULL,
+          service_scope TEXT NOT NULL, effective_from TEXT NOT NULL, effective_to TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL, PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS client_relationship_latest ON client_relationships(customer_id,id,version);''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS graph_knowledge_snapshots(
+          id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id), revision INTEGER NOT NULL,
+          recorded_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, timeline TEXT NOT NULL,
+          UNIQUE(customer_id,revision));
+          CREATE INDEX IF NOT EXISTS graph_knowledge_asof ON graph_knowledge_snapshots(customer_id,recorded_at,revision);
+          CREATE TRIGGER IF NOT EXISTS graph_knowledge_no_update BEFORE UPDATE ON graph_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'graph knowledge snapshots are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS graph_knowledge_no_delete BEFORE DELETE ON graph_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'graph knowledge snapshots are append-only'); END;''')
+        dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
+        if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
+        if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
+        config_columns={r["name"] for r in db.execute("PRAGMA table_info(config_versions)")}
+        if "schema_version" not in config_columns: db.execute("ALTER TABLE config_versions ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
+        change_columns={r["name"] for r in db.execute("PRAGMA table_info(change_sets)")}
+        if "schema_version" not in change_columns: db.execute("ALTER TABLE change_sets ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
+        seed_configuration_schemas(db)
+        if not db.execute("SELECT 1 FROM customers LIMIT 1").fetchone(): seed(db)
+        if not db.execute("SELECT 1 FROM policy_controls LIMIT 1").fetchone(): seed_policies(db)
+        for row in db.execute("SELECT id FROM customers").fetchall():
+            if not db.execute("SELECT 1 FROM config_knowledge_snapshots WHERE customer_id=? LIMIT 1",(row["id"],)).fetchone():
+                snapshot_config_knowledge(db,row["id"],"system.migration","Initiële snapshot bij ingebruikname bitemporele historie",now())
+            if not db.execute("SELECT 1 FROM graph_knowledge_snapshots WHERE customer_id=? LIMIT 1",(row["id"],)).fetchone():
+                snapshot_graph_knowledge(db,row["id"],"system.migration","Initiële graafsnapshot bij ingebruikname bitemporele historie",now())
+            latest=db.execute("SELECT timeline FROM graph_knowledge_snapshots WHERE customer_id=? ORDER BY recorded_at DESC,revision DESC LIMIT 1",(row["id"],)).fetchone()
+            if latest and "requirements" not in json.loads(latest["timeline"]):
+                snapshot_graph_knowledge(db,row["id"],"system.migration","Klantvereisten-baseline; eerdere transaction-time is niet reconstrueerbaar",now())
+            config_snapshot=db.execute("SELECT timeline FROM config_knowledge_snapshots WHERE customer_id=? ORDER BY recorded_at DESC,revision DESC LIMIT 1",(row["id"],)).fetchone()
+            if config_snapshot and any("schema_version" not in v for v in json.loads(config_snapshot["timeline"])):
+                snapshot_config_knowledge(db,row["id"],"system.migration","Configuratieschemaversie-baseline; eerdere schemaverwijzing niet reconstrueerbaar",now())
+
+def seed_policies(db):
+    samples=[
+      ("CLIENT-PAI-DATA","PAI-data-aanlevering per mandaat","Compliance (te bevestigen)","Klant / mandaat / manager","Klantspecifiek contract (synthetisch voorbeeld)","Alleen indien contractueel overeengekomen en toepasselijk vastgesteld","manual","2026-11-03","2027-11-03","pending","Nog te valideren door Compliance/Legal; geen generieke SFDR-claim."),
+      ("WTP-TRANSITION-DATA","Wtp-transitiedata en mijlpalen","Client Service (te bevestigen)","Pensioenfonds / vermogensbeheerketen","Klantafspraak (synthetisch voorbeeld)","Per fonds en transitiefase te bepalen","manual","2026-11-03","2027-11-03","pending","Data-eisen en verantwoordelijkheden zijn klantspecifiek; te valideren."),
+      ("ICT-DORA-SCOPE","Classificatie ICT- en vermogensbeheerdienst","Compliance (te bevestigen)","Dienstverlener / contract","DNB-bron en klantcontract; toepasselijkheid te beoordelen","Classificeer ICT-dienst apart van vermogensbeheeractiviteit","manual","2026-11-03","2027-11-03","pending","Voorbeeldregisteritem; toepasselijkheid nog niet goedgekeurd."),
+    ]
+    for code,title,owner,audience,source,applies,enforcement,effective,review,status,evidence in samples:
+        db.execute("INSERT INTO policy_controls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),code,1,title,owner,audience,source,applies,enforcement,effective,review,status,evidence,"system.seed",now(),"Synthetisch voorbeeld; niet-gevalideerd."))
+
+def _utc_stamp(value):
+    parsed=datetime.fromisoformat(value.replace("Z","+00:00"))
+    if parsed.tzinfo is None: parsed=parsed.replace(tzinfo=timezone.utc)
+    # Browser datetime-local inputs may omit seconds. Treat the selected
+    # precision as inclusive so subsecond audit timestamps in that second or minute match.
+    timepart=value.split("T",1)[1].split("Z",1)[0].split("+",1)[0]
+    if len(timepart)==5: parsed=parsed.replace(second=59,microsecond=999999)
+    elif "T" in value and "." not in timepart: parsed=parsed.replace(microsecond=999999)
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds")
+
+def seed_configuration_schemas(db):
+    for version,schema in config_schema.schema_versions():
+        serialized=json.dumps(schema,sort_keys=True,separators=(",",":"))
+        existing=db.execute("SELECT schema_json FROM config_schema_versions WHERE version=?",(version,)).fetchone()
+        if existing:
+            if existing["schema_json"]!=serialized:
+                raise ValueError(f"Configuratieschema v{version} is onveranderlijk; publiceer een nieuwe versie")
+            continue
+        prior=db.execute("SELECT MAX(version) FROM config_schema_versions").fetchone()[0] or 0
+        if version!=prior+1: raise ValueError(f"Schemaversie moet append-only opvolgen: verwacht v{prior+1}, kreeg v{version}")
+        stamp=now(); actor="system.schema-bootstrap"; rationale=f"Versie uit {schema['$id']} geregistreerd"
+        db.execute("INSERT INTO config_schema_versions VALUES(?,?,?,?,?,?,?,?,?)",(version,schema["$id"],schema["title"],schema["x-owner"],schema["x-effective-from"],stamp,serialized,actor,rationale))
+        audit(db,"configuration_schema",schema["$id"],"registered",actor,rationale,{"version":version,"effective_from":schema["x-effective-from"]})
+
+def configuration_schemas():
+    with connect() as db: rows=db.execute("SELECT version,schema_id,title,owner,effective_from,recorded_at,schema_json FROM config_schema_versions ORDER BY version ASC").fetchall()
+    return [{"version":str(r["version"]),"id":r["schema_id"],"title":r["title"],"owner":r["owner"],"effective_from":r["effective_from"],"recorded_at":r["recorded_at"],"parameters":config_schema.parameter_definitions(json.loads(r["schema_json"]))} for r in rows]
+
+def configuration_schema(version=None,valid_at=None,known_at=None):
+    known_stamp=_utc_stamp(known_at or now()); valid_at=valid_at or datetime.now(timezone.utc).date().isoformat()
+    with connect() as db:
+        if version is not None: row=db.execute("SELECT * FROM config_schema_versions WHERE version=? AND recorded_at<=?",(int(version),known_stamp)).fetchone()
+        else: row=db.execute("SELECT * FROM config_schema_versions WHERE effective_from<=? AND recorded_at<=? ORDER BY version DESC LIMIT 1",(valid_at,known_stamp)).fetchone()
+    if not row: raise ValueError(f"Geen configuratieschema beschikbaar voor valid_at={valid_at} en known_at={known_stamp}")
+    result=dict(row); result["schema"]=json.loads(result.pop("schema_json")); return result
+
+def validate_configuration(configuration,version=None):
+    record=configuration_schema(version); schema=record["schema"]; errors=config_schema.validate(configuration,schema)
+    return {"valid":not errors,"schema_version":str(record["version"]),"errors":errors,"parameters":config_schema.parameter_definitions(schema)}
+
+def audit_configuration_validation(configuration,result,actor,reason):
+    fingerprint=hashlib.sha256(json.dumps(configuration,sort_keys=True,separators=(",",":"),ensure_ascii=False).encode()).hexdigest()
+    with connect() as db:
+        audit(db,"configuration_schema",f"configuration-v{result['schema_version']}","validated",actor,reason,{"schema_version":result["schema_version"],"valid":result["valid"],"error_count":len(result["errors"]),"configuration_sha256":fingerprint})
+
+def customer(cid,valid_at=None,known_at=None):
+    valid_at=valid_at or datetime.now(timezone.utc).date().isoformat(); known_at=_utc_stamp(known_at or now())
+    with connect() as db:
+        base=db.execute("SELECT * FROM customers WHERE id=?",(cid,)).fetchone()
+        if not base:return None
+        snapshot=db.execute("SELECT * FROM config_knowledge_snapshots WHERE customer_id=? AND recorded_at<=? ORDER BY recorded_at DESC,revision DESC LIMIT 1",(cid,known_at)).fetchone()
+        if snapshot:
+            timeline=json.loads(snapshot["timeline"])
+            item=next((v for v in timeline if v["valid_from"]<=valid_at and (v["valid_to"] is None or v["valid_to"]>valid_at)),None)
+            if not item:return None
+            return {**dict(base),**item,"schema_version":item.get("schema_version","1"),"recorded_from":snapshot["recorded_at"],"recorded_to":None,"payload":item["payload"],"snapshot_revision":snapshot["revision"],"known_at":snapshot["recorded_at"],"valid_at":valid_at}
+        # Preserve legacy reads for timestamps predating the first snapshot.
+        row=db.execute('''SELECT c.*,v.version,v.valid_from,v.valid_to,v.recorded_from,v.recorded_to,v.payload,v.schema_version FROM customers c JOIN config_versions v ON c.id=v.customer_id WHERE c.id=? AND v.valid_from<=? AND (v.valid_to IS NULL OR v.valid_to>?) AND v.recorded_from<=? AND (v.recorded_to IS NULL OR v.recorded_to>?) ORDER BY v.version DESC LIMIT 1''',(cid,valid_at,valid_at,known_at,known_at)).fetchone()
+        if not row:return None
+        out=dict(row);out["payload"]=json.loads(row["payload"]);return out
+
+def snapshot_config_knowledge(db,cid,actor,reason,stamp=None):
+    stamp=stamp or now()
+    rows=db.execute("SELECT version,valid_from,valid_to,payload,change_id,schema_version FROM config_versions WHERE customer_id=? AND recorded_to IS NULL ORDER BY valid_from,version",(cid,)).fetchall()
+    timeline=[{"version":r["version"],"valid_from":r["valid_from"],"valid_to":r["valid_to"],"payload":json.loads(r["payload"]),"change_id":r["change_id"],"schema_version":r["schema_version"]} for r in rows]
+    revision=db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM config_knowledge_snapshots WHERE customer_id=?",(cid,)).fetchone()[0]
+    db.execute("INSERT INTO config_knowledge_snapshots VALUES(?,?,?,?,?,?,?)",(str(uuid.uuid4()),cid,revision,stamp,actor,reason,json.dumps(timeline,sort_keys=True)))
+    audit(db,"config_knowledge",cid,"snapshot_captured",actor,reason,{"revision":revision,"recorded_at":stamp,"segments":len(timeline)})
+    return revision
+
+def config_knowledge_history(cid):
+    with connect() as db: rows=db.execute("SELECT revision,recorded_at,actor,reason,timeline FROM config_knowledge_snapshots WHERE customer_id=? ORDER BY revision DESC",(cid,)).fetchall()
+    return [{"revision":r["revision"],"recorded_at":r["recorded_at"],"actor":r["actor"],"reason":r["reason"],"segments":[{k:v.get(k,"1" if k=="schema_version" else None) for k in ("version","valid_from","valid_to","change_id","schema_version")} for v in json.loads(r["timeline"])]} for r in rows]
+
+def customers():
+    with connect() as db: ids=db.execute("SELECT id FROM customers ORDER BY name").fetchall()
+    return [customer(r["id"]) for r in ids]
+
+def audit(db,typ,eid,action,actor,reason,details): db.execute("INSERT INTO audit(entity_type,entity_id,action,actor,reason,at,details) VALUES(?,?,?,?,?,?,?)",(typ,eid,action,actor,reason,now(),json.dumps(details)))
+def change(cid):
+    with connect() as db: row=db.execute("SELECT * FROM change_sets WHERE id=?",(cid,)).fetchone()
+    if not row:return None
+    out=dict(row)
+    for k in ("patch","simulation"): out[k]=json.loads(out[k]) if out[k] else None
+    return out
+def list_changes():
+    with connect() as db: rows=db.execute("SELECT id FROM change_sets ORDER BY created_at DESC").fetchall()
+    return [change(r["id"]) for r in rows]
+def create_change(d):
+    base=customer(d["customer_id"],d["effective_date"])
+    if not base: raise ValueError("Klantconfiguratie niet gevonden op ingangsdatum")
+    if base["version"]!=int(d.get("base_version",base["version"])): raise ValueError("Basisversie verouderd; laad opnieuw")
+    patch=d.get("patch")
+    if not isinstance(patch,dict) or not patch: raise ValueError("Change-set bevat geen wijzigingen")
+    allowed={"fees.bps","fees.minimum_eur","fees.frequency","mandate.benchmark","mandate.delegation","sla.target_percent","reporting.frequency","reporting.deadline_business_days","services"}
+    candidate=json.loads(json.dumps(base["payload"]))
+    for path,value in patch.items():
+        if path not in allowed: raise ValueError(f"Niet-ondersteund configuratiepad: {path}")
+        if path=="fees.bps" and not 0<=float(value)<=1000: raise ValueError("Fee bps moet tussen 0 en 1000 liggen")
+        keys=path.split("."); target=candidate
+        for key in keys[:-1]: target=target[int(key)] if isinstance(target,list) else target[key]
+        if isinstance(target,list) and keys[-1].isdigit(): target[int(keys[-1])]=value
+        elif isinstance(target,dict): target[keys[-1]]=value
+        else: raise ValueError(f"Configuratiepad kan niet worden gewijzigd: {path}")
+    schema_version=str(configuration_schema(valid_at=d["effective_date"])["version"])
+    validation=validate_configuration(candidate,schema_version)
+    if not validation["valid"]: raise ValueError("Configuratie voldoet niet aan schema v"+validation["schema_version"]+": "+"; ".join(f"{e['path']}: {e['message']}" for e in validation["errors"]))
+    cid=str(uuid.uuid4()); actor=d.get("actor","demo.user"); reason=d.get("rationale","").strip()
+    if not reason: raise ValueError("Onderbouwing is verplicht")
+    with connect() as db:
+        db.execute("INSERT INTO change_sets(id,title,customer_id,base_version,patch,effective_date,rationale,status,created_by,created_at,simulation,approved_by,approved_at,activated_at,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,d.get("title") or "Configuratiewijziging",d["customer_id"],base["version"],json.dumps(patch),d["effective_date"],reason,"draft",actor,now(),None,None,None,None,schema_version))
+        audit(db,"change_set",cid,"created",actor,reason,{"base_version":base["version"],"patch":patch,"schema_version":schema_version})
+    return change(cid)
+def simulate(cid,inputs):
+    item=change(cid)
+    if not item:raise ValueError("Change-set niet gevonden")
+    base=customer(item["customer_id"],item["effective_date"]); p=item["patch"]; payload=base["payload"]
+    aum=float(inputs.get("aum_eur",250_000_000)); old=payload["fees"]["bps"]; new=p.get("fees.bps",old)
+    result={"as_of":item["effective_date"],"baseline_version":item["base_version"],"schema_version":item.get("schema_version",base.get("schema_version","1")),"annual_fee_baseline_eur":round(aum*old/10000,2),"annual_fee_scenario_eur":round(aum*float(new)/10000,2),"annual_fee_delta_eur":fee_delta(aum,old,new)/100,"aum_input_eur":aum,"assumptions":["AUM is handmatige scenario-input","Annualized; tiers, minimum fee, FX and performance fees excluded in this MVP"],"operational":["Rapportage- en capaciteitseffecten zijn nog niet doorgerekend"],"compliance":[{"severity":"review","code":"HUMAN_REVIEW_REQUIRED","message":"Beoordeel klantimpact, eerlijke behandeling en toepasselijke beleidsregels; te valideren door Compliance/Legal."}],"affected":["Klantconfiguratie","Mandaat fees" if new!=old else "Mandaat"],"reproducibility":{"engine":"domain-v1","input":{"aum_eur":aum},"change_set":cid}}
+    with connect() as db:
+        db.execute("UPDATE change_sets SET simulation=?,status='simulated' WHERE id=?",(json.dumps(result),cid)); audit(db,"change_set",cid,"simulated",inputs.get("actor","demo.user"),"Impactanalyse",result)
+    return result
+def approve(cid,d):
+    item=change(cid)
+    if not item or item["status"]!="simulated" or not item["simulation"]:raise ValueError("Eerst een simulatie uitvoeren")
+    actor=d.get("actor","demo.approver")
+    if actor==item["created_by"]:raise ValueError("Initiator kan niet zelf goedkeuren (vier-ogen-principe)")
+    with connect() as db:
+        db.execute("UPDATE change_sets SET status='approved',approved_by=?,approved_at=? WHERE id=?",(actor,now(),cid)); audit(db,"change_set",cid,"approved",actor,d.get("reason","Goedgekeurd"),{"simulation":item["simulation"]})
+    return change(cid)
+def activate(cid,d):
+    item=change(cid)
+    if not item or item["status"]!="approved":raise ValueError("Alleen goedgekeurde wijzigingssets kunnen worden geactiveerd")
+    stamp=now()
+    with connect() as db:
+        old=db.execute("SELECT * FROM config_versions WHERE customer_id=? AND recorded_to IS NULL ORDER BY version DESC LIMIT 1",(item["customer_id"],)).fetchone()
+        if old["version"]!=item["base_version"]:raise ValueError("Basisconfiguratie gewijzigd; maak een nieuwe simulatie")
+        payload=json.loads(old["payload"])
+        for path,value in item["patch"].items():
+            keys=path.split("."); cur=payload
+            for key in keys[:-1]:cur=cur[key]
+            cur[keys[-1]]=value
+        if old["valid_from"] < item["effective_date"]:
+            # A future-effective change must leave the former valid-time interval
+            # readable at the present transaction time.
+            db.execute("UPDATE config_versions SET valid_to=? WHERE id=?",(item["effective_date"],old["id"]))
+        else:
+            # A retroactive correction closes what we previously knew, while the
+            # replacement records the corrected knowledge from this timestamp.
+            db.execute("UPDATE config_versions SET recorded_to=? WHERE id=?",(stamp,old["id"]))
+        schema_version=str(item.get("schema_version",old["schema_version"]))
+        validation=validate_configuration(payload,schema_version)
+        if not validation["valid"]: raise ValueError("Configuratie voldoet niet aan schema v"+schema_version+": "+"; ".join(f"{e['path']}: {e['message']}" for e in validation["errors"]))
+        db.execute("INSERT INTO config_versions(id,customer_id,version,valid_from,valid_to,recorded_from,recorded_to,payload,change_id,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),item["customer_id"],old["version"]+1,item["effective_date"],old["valid_to"],stamp,None,json.dumps(payload),cid,schema_version))
+        db.execute("UPDATE change_sets SET status='active',activated_at=? WHERE id=?",(stamp,cid)); audit(db,"change_set",cid,"activated",d.get("actor","demo.operator"),d.get("reason","Geactiveerd"),{"new_version":old["version"]+1,"schema_version":schema_version})
+        snapshot_config_knowledge(db,item["customer_id"],d.get("actor","demo.operator"),d.get("reason","Geactiveerd"),stamp)
+    return change(cid)
+def profiles():
+    with connect() as db: rows=db.execute("SELECT * FROM partner_profiles ORDER BY name").fetchall()
+    return [{**dict(r),"mapping":json.loads(r["mapping"])} for r in rows]
+def export_config(cid,profile_id,actor="demo.publisher",valid_at=None):
+    cfg=customer(cid,valid_at)
+    if not cfg:raise ValueError("Geen configuratie gevonden")
+    validation=validate_configuration(cfg["payload"],cfg.get("schema_version","1"))
+    if not validation["valid"]:raise ValueError("Configuratie voldoet niet aan schema v"+validation["schema_version"]+": "+"; ".join(f"{e['path']}: {e['message']}" for e in validation["errors"]))
+    with connect() as db: profile=db.execute("SELECT * FROM partner_profiles WHERE id=?",(profile_id,)).fetchone()
+    if not profile:raise ValueError("Partnerprofiel niet gevonden")
+    body={"metadata":{"customer_id":cid,"config_version":cfg["version"],"configuration_schema_version":cfg.get("schema_version","1"),"schema_version":profile["schema_version"],"profile":profile_id,"generated_at":now()},"configuration":{"customer":{"name":cfg["name"],"type":cfg["kind"],"jurisdiction":cfg["jurisdiction"]},**cfg["payload"]}}
+    serialized=json.dumps(body,sort_keys=True,separators=(",",":")); checksum=hashlib.sha256(serialized.encode()).hexdigest(); eid=str(uuid.uuid4())
+    with connect() as db:
+        db.execute("INSERT INTO exports VALUES(?,?,?,?,?,?,?,?,?,?)",(eid,cid,cfg["version"],profile_id,profile["schema_version"],checksum,serialized,"generated",actor,now())); audit(db,"export",eid,"generated",actor,"Partnerconfiguratie-export",{"customer_id":cid,"profile":profile_id,"checksum":checksum})
+    return {"export_id":eid,"checksum":checksum,"filename":f"{cid}-v{cfg['version']}-{eid[:8]}.json","payload":body}
+def audit_log(limit=100):
+    with connect() as db: rows=db.execute("SELECT * FROM audit ORDER BY at DESC LIMIT ?",(limit,)).fetchall()
+    return [{**dict(r),"details":json.loads(r["details"])} for r in rows]
+
+def _config_value(payload,path):
+    if not path:return None
+    value=payload
+    try:
+        for key in path.split("."):
+            value=value[int(key)] if isinstance(value,list) else value[key]
+        return value
+    except (KeyError,IndexError,TypeError,ValueError):return None
+
+def client_requirements(customer_id=None, valid_at=None, known_at=None):
+    with connect() as db:
+        if customer_id and valid_at and known_at:
+            snapshot=db.execute("SELECT timeline FROM graph_knowledge_snapshots WHERE customer_id=? AND recorded_at<=? ORDER BY recorded_at DESC,revision DESC LIMIT 1",(customer_id,_utc_stamp(known_at))).fetchone()
+            timeline=json.loads(snapshot["timeline"]) if snapshot else {"requirements":[]}
+            candidates=[r for r in timeline.get("requirements",[]) if r["effective_date"]<=valid_at]
+            latest_by_id={}
+            for requirement in candidates:
+                prior=latest_by_id.get(requirement["id"])
+                if not prior or (requirement["effective_date"],requirement["version"])>(prior["effective_date"],prior["version"]):
+                    latest_by_id[requirement["id"]]=requirement
+            rows=sorted(latest_by_id.values(),key=lambda r:(r["effective_date"],r["created_at"]),reverse=True)
+        elif customer_id:
+            rows=db.execute('''SELECT r.* FROM client_requirements r JOIN
+              (SELECT id,MAX(version) version FROM client_requirements WHERE customer_id=? GROUP BY id) latest
+              ON r.id=latest.id AND r.version=latest.version ORDER BY r.created_at DESC''',(customer_id,)).fetchall()
+        else:
+            rows=db.execute('''SELECT r.* FROM client_requirements r JOIN
+              (SELECT id,MAX(version) version FROM client_requirements GROUP BY id) latest
+              ON r.id=latest.id AND r.version=latest.version ORDER BY r.created_at DESC''').fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row); cfg=customer(item["customer_id"],valid_at or item["effective_date"],known_at); actual=_config_value(cfg["payload"],item["config_path"]) if cfg else None
+        item["actual_value"]=actual
+        item["reconciliation"]="manual_review" if not item["config_path"] else ("unmapped" if actual is None else ("configured_match" if str(actual)==str(item["expected_value"]) else "configuration_gap"))
+        result.append(item)
+    return result
+
+def save_client_requirement(data):
+    required=("customer_id","category","title","requirement","source_ref","frequency","effective_date","review_date","rationale")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["effective_date"]) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["review_date"]):raise ValueError
+        date.fromisoformat(data["effective_date"]); date.fromisoformat(data["review_date"])
+    except ValueError:raise ValueError("Geldigheids- en reviewdatum moeten ISO-formaat YYYY-MM-DD hebben")
+    if not customer(data["customer_id"]):raise ValueError("Klant niet gevonden")
+    allowed={"esg","sfdr_pai","wtp","reporting","disclosure","costs","chain","outsourcing"}
+    category=data["category"]
+    if category not in allowed:raise ValueError("Ongeldige categorie")
+    req_id=data.get("id") or str(uuid.uuid4()); actor=data.get("actor","demo.client-service").strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM client_requirements WHERE id=? AND customer_id=?",(req_id,data["customer_id"])).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO client_requirements VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(req_id,version,data["customer_id"],category,data["title"].strip(),data["requirement"].strip(),data["source_ref"].strip(),(data.get("config_path") or "").strip() or None,(data.get("expected_value") or "").strip() or None,data["frequency"].strip(),data["effective_date"],data["review_date"],actor,stamp,data["rationale"].strip()))
+        audit(db,"client_requirement",req_id,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"category":category,"source_ref":data["source_ref"].strip()})
+        snapshot_graph_knowledge(db,data["customer_id"],actor,data["rationale"],stamp)
+    return next(r for r in client_requirements(data["customer_id"]) if r["id"]==req_id)
+
+def dora_assessments(valid_at=None, known_at=None, customer_id=None):
+    known_at=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("""SELECT d.* FROM dora_assessments d JOIN
+          (SELECT id,MAX(version) version FROM dora_assessments WHERE created_at<=? GROUP BY id) latest
+          ON d.id=latest.id AND d.version=latest.version
+          WHERE (? IS NULL OR d.customer_id=? OR d.customer_id IS NULL) ORDER BY d.created_at DESC""",(known_at,customer_id,customer_id)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        if not item["effective_from"]: item["validity_status"]="unset_legacy"
+        elif valid_at and item["effective_from"]<=valid_at and (not item["effective_to"] or item["effective_to"]>valid_at): item["validity_status"]="valid"
+        elif valid_at: continue
+        else: item["validity_status"]="dated"
+        result.append(item)
+    return result
+
+def save_dora_assessment(data):
+    required=("assessment_type","counterparty","service_name","scope_description","applicability","criticality","contract_ref","source_ref","reviewer","reviewer_role","rationale","review_date","effective_from")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    kinds={"managed_activity","supplier_ict","platform_ict"}
+    applicability={"pending_review","in_scope","out_of_scope"}
+    criticality={"unassessed","critical_important","other"}
+    if data["assessment_type"] not in kinds:raise ValueError("Ongeldig classificatietype")
+    if data["applicability"] not in applicability:raise ValueError("Ongeldige toepasselijkheidsstatus")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["effective_from"]):raise ValueError
+        date.fromisoformat(data["effective_from"])
+        effective_to=(data.get("effective_to") or "").strip() or None
+        if effective_to and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}",effective_to) or date.fromisoformat(effective_to)<=date.fromisoformat(data["effective_from"])):raise ValueError
+    except ValueError:raise ValueError("Geldigheidsperiode moet ISO YYYY-MM-DD zijn; einddatum moet na startdatum liggen")
+    if data["criticality"] not in criticality:raise ValueError("Ongeldige kritikaliteitsstatus")
+    customer_id=(data.get("customer_id") or "").strip() or None
+    if customer_id and not customer(customer_id):raise ValueError("Klant niet gevonden")
+    role=data["reviewer_role"]
+    if role not in {"compliance","legal","risk","ict_risk"}:raise ValueError("Reviewerrol moet Compliance, Legal, Risk of ICT-risk zijn")
+    assessment_id=data.get("id") or str(uuid.uuid4()); actor=data.get("actor",data["reviewer"]).strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM dora_assessments WHERE id=?",(assessment_id,)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO dora_assessments(id,version,assessment_type,customer_id,counterparty,service_name,scope_description,applicability,criticality,contract_ref,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(assessment_id,version,data["assessment_type"],customer_id,data["counterparty"].strip(),data["service_name"].strip(),data["scope_description"].strip(),data["applicability"],data["criticality"],data["contract_ref"].strip(),data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
+        audit(db,"dora_assessment",assessment_id,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"assessment_type":data["assessment_type"],"customer_id":customer_id,"applicability":data["applicability"],"criticality":data["criticality"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
+    return next(r for r in dora_assessments() if r["id"]==assessment_id)
+
+def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
+    stamp=stamp or now()
+    entities=[dict(r) for r in db.execute('''SELECT e.* FROM client_entities e JOIN
+      (SELECT id,MAX(version) version FROM client_entities WHERE customer_id=? GROUP BY id) latest
+      ON e.id=latest.id AND e.version=latest.version ORDER BY e.entity_type,e.name''',(customer_id,)).fetchall()]
+    relationships=[dict(r) for r in db.execute('''SELECT r.* FROM client_relationships r JOIN
+      (SELECT id,MAX(version) version FROM client_relationships WHERE customer_id=? GROUP BY id) latest
+      ON r.id=latest.id AND r.version=latest.version ORDER BY r.created_at DESC''',(customer_id,)).fetchall()]
+    requirements=[dict(r) for r in db.execute("SELECT * FROM client_requirements WHERE customer_id=? ORDER BY id,version",(customer_id,)).fetchall()]
+    revision=db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM graph_knowledge_snapshots WHERE customer_id=?",(customer_id,)).fetchone()[0]
+    timeline={"entities":entities,"relationships":relationships,"requirements":requirements}
+    db.execute("INSERT INTO graph_knowledge_snapshots VALUES(?,?,?,?,?,?,?)",(str(uuid.uuid4()),customer_id,revision,stamp,actor,reason,json.dumps(timeline,sort_keys=True)))
+    audit(db,"client_graph",customer_id,"snapshot_captured",actor,reason,{"revision":revision,"recorded_at":stamp,"entities":len(entities),"relationships":len(relationships),"requirements":len(requirements)})
+    return revision
+
+def graph_knowledge_history(customer_id):
+    with connect() as db: rows=db.execute("SELECT revision,recorded_at,actor,reason,timeline FROM graph_knowledge_snapshots WHERE customer_id=? ORDER BY revision DESC",(customer_id,)).fetchall()
+    return [{"revision":r["revision"],"recorded_at":r["recorded_at"],"actor":r["actor"],"reason":r["reason"],"entities":len(json.loads(r["timeline"]).get("entities",[])),"relationships":len(json.loads(r["timeline"]).get("relationships",[])),"requirements":len(json.loads(r["timeline"]).get("requirements",[]))} for r in rows]
+
+def client_graph(customer_id, valid_at=None, known_at=None):
+    valid_at=valid_at or datetime.now(timezone.utc).date().isoformat()
+    known_at=_utc_stamp(known_at or now())
+    root=customer(customer_id,valid_at,known_at)
+    if not root:return []
+    with connect() as db:
+        snapshot=db.execute("SELECT * FROM graph_knowledge_snapshots WHERE customer_id=? AND recorded_at<=? ORDER BY recorded_at DESC,revision DESC LIMIT 1",(customer_id,known_at)).fetchone()
+    timeline=json.loads(snapshot["timeline"]) if snapshot else {"entities":[],"relationships":[]}
+    entities=[e for e in timeline["entities"] if e["effective_from"]<=valid_at and (not e["effective_to"] or e["effective_to"]>valid_at)]
+    client_root={"id":customer_id,"version":root["version"],"customer_id":customer_id,"entity_type":"customer","name":root["name"],"legal_identifier":"","jurisdiction":root["jurisdiction"],"classification":root["classification"],"effective_from":root["valid_from"],"effective_to":None,"source_ref":"Customer register","rationale":"Read-only root from the customer master record.","created_by":"customer-master","created_at":root["recorded_from"],"read_only":True}
+    entity_map={e["id"]:e["name"] for e in [client_root]+entities}
+    relationships=[]
+    for rel in timeline["relationships"]:
+        if rel["effective_from"]<=valid_at and (not rel["effective_to"] or rel["effective_to"]>valid_at):
+            rel["from_name"]=entity_map.get(rel["from_entity_id"],"(entiteit niet actief op geldigheidsdatum)")
+            rel["to_name"]=entity_map.get(rel["to_entity_id"],"(entiteit niet actief op geldigheidsdatum)")
+            relationships.append(rel)
+    return {"customer_id":customer_id,"valid_at":valid_at,"known_at":snapshot["recorded_at"] if snapshot else None,"snapshot_revision":snapshot["revision"] if snapshot else None,"entities":[client_root]+entities,"relationships":relationships}
+
+def client_entities(customer_id, valid_at=None, known_at=None):
+    graph=client_graph(customer_id,valid_at,known_at)
+    return graph["entities"] if graph else []
+
+def save_client_entity(data):
+    required=("customer_id","entity_type","name","jurisdiction","classification","effective_from","source_ref","rationale")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]):raise ValueError("Klant niet gevonden")
+    allowed={"customer","legal_entity","group","fund","fiduciary","asset_manager","sub_manager","custodian","service_provider","other"}
+    if data["entity_type"] not in allowed:raise ValueError("Ongeldig entiteitstype")
+    try:date.fromisoformat(data["effective_from"]); date.fromisoformat(data["effective_to"]) if data.get("effective_to") else None
+    except ValueError:raise ValueError("Geldigheidsdatum moet ISO-formaat YYYY-MM-DD hebben")
+    legal_id=(data.get("legal_identifier") or "").strip()
+    # Legal identifiers are optional for synthetic/prototype records. No personal data belongs here.
+    if data.get("effective_to") and data["effective_to"]<=data["effective_from"]:raise ValueError("Einddatum moet na de ingangsdatum liggen")
+    eid=data.get("id") or str(uuid.uuid4()); actor=data.get("actor","demo.client-service").strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM client_entities WHERE id=? AND customer_id=?",(eid,data["customer_id"])).fetchone()["version"]
+        if previous is None and data.get("id"):raise ValueError("Entiteit voor deze klant niet gevonden")
+        version=(previous or 0)+1
+        db.execute("INSERT INTO client_entities VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(eid,version,data["customer_id"],data["entity_type"],data["name"].strip(),legal_id,data["jurisdiction"].strip(),data["classification"].strip(),data["effective_from"],data.get("effective_to") or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"client_entity",eid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"entity_type":data["entity_type"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
+        snapshot_graph_knowledge(db,data["customer_id"],actor,data["rationale"],stamp)
+    with connect() as db: saved=db.execute("SELECT * FROM client_entities WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(eid,data["customer_id"])).fetchone()
+    return dict(saved)
+
+def client_relationships(customer_id, valid_at=None, known_at=None):
+    graph=client_graph(customer_id,valid_at,known_at)
+    return graph["relationships"] if graph else []
+
+def save_client_relationship(data):
+    required=("customer_id","from_entity_id","to_entity_id","relationship_type","service_scope","effective_from","source_ref","rationale")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]):raise ValueError("Klant niet gevonden")
+    if data["from_entity_id"]==data["to_entity_id"]:raise ValueError("Een relatie kan niet naar dezelfde entiteit verwijzen")
+    allowed={"member_of_group","parent_of","fiduciary_for","manages","subdelegates_to","custody_for","service_provider_for","client_of"}
+    if data["relationship_type"] not in allowed:raise ValueError("Ongeldig relatietype")
+    try:date.fromisoformat(data["effective_from"]); date.fromisoformat(data["effective_to"]) if data.get("effective_to") else None
+    except ValueError:raise ValueError("Geldigheidsdatum moet ISO-formaat YYYY-MM-DD hebben")
+    entities={e["id"] for e in client_entities(data["customer_id"])}
+    if data["from_entity_id"] not in entities or data["to_entity_id"] not in entities:raise ValueError("Beide relatie-entiteiten moeten binnen dezelfde klantconfiguratie bestaan")
+    if data.get("effective_to") and data["effective_to"]<=data["effective_from"]:raise ValueError("Einddatum moet na de ingangsdatum liggen")
+    rid=data.get("id") or str(uuid.uuid4());actor=data.get("actor","demo.client-service").strip();stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM client_relationships WHERE id=? AND customer_id=?",(rid,data["customer_id"])).fetchone()["version"]
+        if previous is None and data.get("id"):raise ValueError("Relatie voor deze klant niet gevonden")
+        version=(previous or 0)+1
+        db.execute("INSERT INTO client_relationships VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,data["customer_id"],data["from_entity_id"],data["to_entity_id"],data["relationship_type"],data["service_scope"].strip(),data["effective_from"],data.get("effective_to") or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"client_relationship",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"from_entity_id":data["from_entity_id"],"to_entity_id":data["to_entity_id"],"relationship_type":data["relationship_type"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
+        snapshot_graph_knowledge(db,data["customer_id"],actor,data["rationale"],stamp)
+    with connect() as db: saved=db.execute("SELECT * FROM client_relationships WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(rid,data["customer_id"])).fetchone()
+    return dict(saved)
+
+def policies(control_code=None):
+    with connect() as db:
+        if control_code:
+            rows=db.execute("SELECT * FROM policy_controls WHERE control_code=? ORDER BY version DESC",(control_code,)).fetchall()
+        else:
+            rows=db.execute("SELECT p.* FROM policy_controls p JOIN (SELECT control_code,MAX(version) AS version FROM policy_controls GROUP BY control_code) latest ON p.control_code=latest.control_code AND p.version=latest.version ORDER BY p.control_code").fetchall()
+    result=[]
+    with connect() as db:
+        for row in rows:
+            item=dict(row)
+            review=db.execute("SELECT * FROM policy_source_reviews WHERE control_code=? AND policy_version=? ORDER BY checked_at DESC LIMIT 1",(item["control_code"],item["version"])).fetchone()
+            decision=db.execute("SELECT * FROM policy_decisions WHERE control_code=? AND policy_version=? ORDER BY decided_at DESC LIMIT 1",(item["control_code"],item["version"])).fetchone()
+            item["latest_source_review"]=dict(review) if review else None
+            item["decision"]=dict(decision) if decision else None
+            item["validation_status"]=(decision["decision"] if decision else "pending")
+            if decision and decision["decision"]=="validated" and review and review["checked_at"]>decision["decided_at"]:
+                item["validation_status"]="pending"
+            result.append(item)
+    return result
+
+def policies_as_of(valid_at, known_at):
+    """Return policy versions effective at valid_at and recorded by known_at."""
+    known_stamp=_utc_stamp(known_at)
+    with connect() as db:
+        rows=db.execute("SELECT * FROM policy_controls WHERE created_at<=? ORDER BY control_code,effective_date,version",(known_stamp,)).fetchall()
+    grouped={}
+    for row in rows:
+        item=dict(row)
+        if item["effective_date"]<=valid_at:
+            prior=grouped.get(item["control_code"])
+            if not prior or (item["effective_date"],item["version"])>(prior["effective_date"],prior["version"]):
+                grouped[item["control_code"]]=item
+    result=[]
+    with connect() as db:
+        for item in grouped.values():
+            review=db.execute("SELECT * FROM policy_source_reviews WHERE control_code=? AND policy_version=? AND checked_at<=? ORDER BY checked_at DESC LIMIT 1",(item["control_code"],item["version"],known_stamp)).fetchone()
+            decision=db.execute("SELECT * FROM policy_decisions WHERE control_code=? AND policy_version=? AND decided_at<=? ORDER BY decided_at DESC LIMIT 1",(item["control_code"],item["version"],known_stamp)).fetchone()
+            item["latest_source_review"]=dict(review) if review else None
+            item["decision"]=dict(decision) if decision else None
+            item["validation_status"]=(decision["decision"] if decision else "pending")
+            if decision and decision["decision"]=="validated" and review and review["checked_at"]>decision["decided_at"]: item["validation_status"]="pending"
+            item["valid_at"]=valid_at; item["known_at"]=known_stamp
+            result.append(item)
+    return sorted(result,key=lambda policy:policy["control_code"])
+
+def save_policy(data, control_code=None):
+    required=("control_code","title","owner","audience","source_ref","applicability","enforcement","effective_date","review_date")
+    if not control_code and not data.get("control_code","").strip(): raise ValueError("Controlcode is verplicht")
+    for key in required[1:]:
+        if not str(data.get(key,"")).strip(): raise ValueError(f"{key.replace('_',' ').capitalize()} is verplicht")
+    try:
+        from datetime import date
+        effective=date.fromisoformat(data["effective_date"]); review=date.fromisoformat(data["review_date"])
+    except ValueError: raise ValueError("Effectieve datum en reviewdatum moeten geldige ISO-datums zijn")
+    if review < effective: raise ValueError("Reviewdatum mag niet voor de ingangsdatum liggen")
+    enforcement=data["enforcement"]
+    status=data.get("validation_status","pending")
+    evidence=data.get("validation_evidence","").strip()
+    if enforcement not in {"hard","soft","manual"}: raise ValueError("Handhavingsniveau moet hard, soft of manual zijn")
+    if status!="pending": raise ValueError("Validatiestatus wordt uitsluitend via de bronreview- en besluitworkflow vastgesteld")
+    code=(control_code or data["control_code"]).strip().upper()
+    actor=data.get("actor","demo.policy-owner").strip() or "demo.policy-owner"
+    note=data.get("change_note","").strip() or ("Eerste registratie" if not control_code else "Nieuwe append-only versie")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) AS version FROM policy_controls WHERE control_code=?",(code,)).fetchone()["version"]
+        if control_code and previous is None: raise ValueError("Controlcode niet gevonden")
+        if not control_code and previous is not None: raise ValueError("Controlcode bestaat al; maak een nieuwe versie")
+        version=(previous or 0)+1; stamp=now(); record_id=str(uuid.uuid4())
+        db.execute("INSERT INTO policy_controls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(record_id,code,version,data["title"].strip(),data["owner"].strip(),data["audience"].strip(),data["source_ref"].strip(),data["applicability"].strip(),enforcement,data["effective_date"],data["review_date"],status,evidence,actor,stamp,note))
+        audit(db,"policy_control",record_id,"created" if version==1 else "versioned",actor,note,{"control_code":code,"version":version,"validation_status":status,"enforcement":enforcement})
+    return policies(code)[0]
+
+def policy_source_reviews(control_code,version):
+    with connect() as db:
+        exists=db.execute("SELECT 1 FROM policy_controls WHERE control_code=? AND version=?",(control_code,version)).fetchone()
+        if not exists:return None
+        rows=db.execute("SELECT * FROM policy_source_reviews WHERE control_code=? AND policy_version=? ORDER BY checked_at DESC",(control_code,version)).fetchall()
+    return [dict(r) for r in rows]
+
+def add_policy_source_review(control_code,version,data):
+    versions=policies(control_code)
+    policy=next((p for p in versions if p["version"]==int(version)),None)
+    if not policy:raise ValueError("Policyversie niet gevonden")
+    kind=data.get("source_kind",""); outcome=data.get("outcome","")
+    allowed_kinds={"primary_regulatory","customer_contract","customer_policy","secondary_guidance","user_claim","generated"}
+    if kind not in allowed_kinds:raise ValueError("Onbekende bronsoort")
+    if outcome not in {"verified","insufficient","pending"}:raise ValueError("Ongeldige bronreview-uitkomst")
+    if not data.get("source_title","").strip() or not data.get("source_locator","").strip() or not data.get("rationale","").strip():raise ValueError("Bronnaam, bronreferentie en reviewmotivering zijn verplicht")
+    if outcome=="verified" and kind not in {"primary_regulatory","customer_contract","customer_policy"}:
+        raise ValueError("Alleen een primaire bron, klantcontract of vastgesteld klantbeleid kan als gevalideerde bron gelden")
+    actor=data.get("reviewer","demo.source-reviewer").strip(); role=data.get("reviewer_role","")
+    if not actor:raise ValueError("Reviewer is verplicht")
+    if role not in {"compliance","legal","policy_owner"}:raise ValueError("Reviewerrol moet Compliance, Legal of policy-eigenaar zijn")
+    if outcome=="verified" and actor==policy["created_by"]:raise ValueError("Bronverificatie vereist een andere reviewer dan de initiator")
+    review_id=str(uuid.uuid4()); stamp=now()
+    with connect() as db:
+        db.execute("INSERT INTO policy_source_reviews VALUES(?,?,?,?,?,?,?,?,?,?,?)",(review_id,control_code,int(version),kind,data["source_title"].strip(),data["source_locator"].strip(),outcome,actor,role,data["rationale"].strip(),stamp))
+        audit(db,"policy_source_review",review_id,"source_reviewed",actor,data["rationale"],{"control_code":control_code,"version":int(version),"source_kind":kind,"outcome":outcome})
+    return policy_source_reviews(control_code,version)
+
+def decide_policy(control_code,version,data):
+    versions=policies(control_code); policy=next((p for p in versions if p["version"]==int(version)),None)
+    if not policy:raise ValueError("Policyversie niet gevonden")
+    decision=data.get("decision","validated"); actor=data.get("reviewer","demo.policy-approver").strip(); role=data.get("reviewer_role","")
+    rationale=data.get("rationale","").strip()
+    if decision not in {"validated","rejected"}:raise ValueError("Besluit moet validated of rejected zijn")
+    if role not in {"compliance","legal","policy_owner"}:raise ValueError("Reviewerrol moet Compliance, Legal of policy-eigenaar zijn")
+    if not actor or not rationale:raise ValueError("Beslisser en motivering zijn verplicht")
+    if actor==policy["created_by"]:raise ValueError("Policybesluit vereist een andere persoon dan de initiator")
+    review=policy["latest_source_review"]
+    if decision=="validated":
+        if not review or review["outcome"]!="verified":raise ValueError("Valideren vereist eerst een geverifieerde primaire bron of klantbron")
+        if actor==review["reviewer"]:raise ValueError("Policybesluit vereist een andere reviewer dan de bronreviewer")
+        if role in {"compliance","legal"} and review["reviewer_role"] in {"compliance","legal"} and actor==review["reviewer"]:raise ValueError("Policyvalidatie en bronreview moeten door verschillende personen worden uitgevoerd")
+    decision_id=str(uuid.uuid4()); stamp=now()
+    with connect() as db:
+        db.execute("INSERT INTO policy_decisions VALUES(?,?,?,?,?,?,?,?,?)",(decision_id,control_code,int(version),review["id"] if review else None,decision,actor,role,rationale,stamp))
+        audit(db,"policy_control",policy["id"],"policy_decision",actor,rationale,{"control_code":control_code,"version":int(version),"decision":decision,"source_review_id":review["id"] if review else None})
+    return policies(control_code)
+init()

@@ -1,0 +1,35 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Policy Register Temporal Read API",
+    "version": "1.0.0",
+    "description": "Tijdreisquery voor versieerbare controls. Policy-uitkomsten blijven menselijke beoordelingen."
+  },
+  "paths": {
+    "/api/v1/policies": {
+      "get": {
+        "summary": "Controls effectief op een datum en bekend op een tijdstip",
+        "parameters": [
+          {"name": "valid_at", "in": "query", "required": true, "schema": {"type": "string", "format": "date"}},
+          {"name": "known_at", "in": "query", "required": true, "schema": {"type": "string", "format": "date-time", "description": "UTC ISO 8601"}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Eén effectieve versie per controlcode, met bronreview- en besluitstatus zoals toen bekend",
+            "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object", "required": ["control_code", "version", "effective_date", "review_date", "created_at", "validation_status", "valid_at", "known_at"], "properties": {
+              "control_code": {"type": "string"},
+              "version": {"type": "integer"},
+              "effective_date": {"type": "string", "format": "date", "description": "Inclusieve valid-time start"},
+              "review_date": {"type": "string", "format": "date", "description": "Reviewdeadline; beëindigt valid-time niet"},
+              "created_at": {"type": "string", "format": "date-time"},
+              "validation_status": {"type": "string"},
+              "valid_at": {"type": "string", "format": "date"},
+              "known_at": {"type": "string", "format": "date-time"}
+            }}}}}
+          },
+          "400": {"description": "Ongeldige of ontbrekende tijdparameters"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Client requirements temporal query API",
+    "version": "1.0.0",
+    "description": "Reconstrueert klantvereisten op basis van een geldigheidsdatum en een kennisdatum. Dit is een prototypecontract; uitkomsten zijn geen complianceconclusie."
+  },
+  "paths": {
+    "/api/v1/customers/{customer_id}/client-requirements": {
+      "get": {
+        "operationId": "getClientRequirementsAsOf",
+        "summary": "Reconstrueer klantvereisten op twee tijdassen",
+        "parameters": [
+          {
+            "name": "customer_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "valid_at",
+            "in": "query",
+            "required": true,
+            "description": "Geldigheidsdatum; een vereiste geldt vanaf effective_date. review_date beëindigt de geldigheid niet.",
+            "schema": { "type": "string", "format": "date" }
+          },
+          {
+            "name": "known_at",
+            "in": "query",
+            "required": true,
+            "description": "Kennisdatum en -tijd in UTC (ISO 8601). Een tijd zonder seconden is inclusief de hele minuut.",
+            "schema": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}(?::\\d{2}(?:\\.\\d{1,6})?)?(?:Z|\\+00:00)?$"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Vereisteversies die op beide tijdassen bekend en geldig zijn.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/ClientRequirement" }
+                }
+              }
+            }
+          },
+          "400": { "description": "valid_at of known_at ontbreekt of heeft een ongeldig formaat." },
+          "404": { "description": "Klantconfiguratie niet gevonden." }
+        }
+      }
+    },
+    "/api/v1/customers/{customer_id}/register-history": {
+      "get": {
+        "operationId": "getCustomerRegisterHistory",
+        "summary": "Lees append-only klantregistersnapshots",
+        "parameters": [
+          {
+            "name": "customer_id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Kennisrevisies met aantallen entiteiten, relaties en vereisteversies.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/RegisterSnapshot" }
+                }
+              }
+            }
+          },
+          "404": { "description": "Klantconfiguratie of registergeschiedenis niet gevonden." }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ClientRequirement": {
+        "type": "object",
+        "required": [
+          "id", "version", "customer_id", "category", "title", "requirement",
+          "source_ref", "frequency", "effective_date", "review_date", "created_by",
+          "created_at", "rationale", "actual_value", "reconciliation"
+        ],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "version": { "type": "integer", "minimum": 1 },
+          "customer_id": { "type": "string" },
+          "category": { "type": "string", "enum": ["esg", "sfdr_pai", "wtp", "reporting", "disclosure", "costs", "chain", "outsourcing"] },
+          "title": { "type": "string" },
+          "requirement": { "type": "string" },
+          "source_ref": { "type": "string" },
+          "config_path": { "type": ["string", "null"] },
+          "expected_value": { "type": ["string", "null"] },
+          "frequency": { "type": "string" },
+          "effective_date": { "type": "string", "format": "date" },
+          "review_date": { "type": "string", "format": "date" },
+          "created_by": { "type": "string" },
+          "created_at": { "type": "string", "format": "date-time" },
+          "rationale": { "type": "string" },
+          "actual_value": {},
+          "reconciliation": { "type": "string", "enum": ["configured_match", "configuration_gap", "unmapped", "manual_review"] }
+        }
+      },
+      "RegisterSnapshot": {
+        "type": "object",
+        "required": ["revision", "recorded_at", "actor", "reason", "entities", "relationships", "requirements"],
+        "properties": {
+          "revision": { "type": "integer", "minimum": 1 },
+          "recorded_at": { "type": "string", "format": "date-time" },
+          "actor": { "type": "string" },
+          "reason": { "type": "string" },
+          "entities": { "type": "integer", "minimum": 0 },
+          "relationships": { "type": "integer", "minimum": 0 },
+          "requirements": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
