@@ -53,17 +53,16 @@ def apply_cap_floor(value, cap=None, floor=None):
 
 
 def tiered_fee(aum, tiers):
-    """tiers: list of (from, to, bps). Returns fee in same minor units convention? Returns Decimal amount."""
+    """tiers: list of (from, to, bps). Returns Decimal fee amount."""
     total = Decimal("0")
-    remaining = Decimal(str(aum))
-    for lo, hi, bps in tiers:
-        band = min(Decimal(str(hi)) if hi is not None else remaining, remaining) - Decimal(str(lo))
+    aum_d = Decimal(str(aum))
+    for lo, hi, bps in (tiers or []):
+        lo_d = Decimal(str(lo))
+        hi_d = Decimal(str(hi)) if hi is not None else aum_d
+        band = min(hi_d, aum_d) - lo_d
         if band <= 0:
             continue
         total += band * Decimal(str(bps)) / Decimal(10000)
-        remaining -= band
-        if remaining <= 0:
-            break
     return total
 
 
@@ -73,12 +72,18 @@ def minimum_fee(calculated, minimum):
 
 def performance_fee(profit, hurdle_rate_pct, high_water_mark=None, performance_fee_pct=0):
     profit = Decimal(str(profit))
-    hurdle = Decimal(str(hurdle_rate_pct or 0)) / Decimal(100) * Decimal(str(profit))  # placeholder
-    # simple: fee applies to profit above hurdle
+    # high-water mark gates: no fee if profit does not exceed HWM
+    if high_water_mark is not None and profit <= Decimal(str(high_water_mark)):
+        return Decimal("0")
     base = profit
     if high_water_mark is not None:
-        base = max(base - Decimal(str(high_water_mark)), Decimal("0"))
-    fee = base * Decimal(str(performance_fee_pct)) / Decimal(100)
+        base = profit - Decimal(str(high_water_mark))
+    # hurdle rate exempts a percentage of the profit base
+    hurdle = base * Decimal(str(hurdle_rate_pct or 0)) / Decimal(100)
+    taxable = base - hurdle
+    if taxable < 0:
+        taxable = Decimal("0")
+    fee = taxable * Decimal(str(performance_fee_pct)) / Decimal(100)
     return fee
 
 
