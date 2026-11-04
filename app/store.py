@@ -100,6 +100,17 @@ def init():
           CREATE INDEX IF NOT EXISTS dora_assessment_latest ON dora_assessments(id,version);
           CREATE TRIGGER IF NOT EXISTS dora_assessment_no_update BEFORE UPDATE ON dora_assessments BEGIN SELECT RAISE(ABORT,'DORA assessments are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS dora_assessment_no_delete BEFORE DELETE ON dora_assessments BEGIN SELECT RAISE(ABORT,'DORA assessments are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS ict_provider_relations(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT REFERENCES customers(id),
+          provider TEXT NOT NULL, ict_service TEXT NOT NULL, function_classification TEXT NOT NULL,
+          contract_ref TEXT NOT NULL, incident_evidence TEXT NOT NULL, exit_evidence TEXT NOT NULL,
+          applicability TEXT NOT NULL, source_ref TEXT NOT NULL, reviewer TEXT NOT NULL,
+          reviewer_role TEXT NOT NULL, rationale TEXT NOT NULL, review_date TEXT NOT NULL,
+          created_at TEXT NOT NULL, effective_from TEXT, effective_to TEXT,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS ict_provider_relation_latest ON ict_provider_relations(id,version);
+          CREATE TRIGGER IF NOT EXISTS ict_provider_relation_no_update BEFORE UPDATE ON ict_provider_relations BEGIN SELECT RAISE(ABORT,'ICT provider relations are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS ict_provider_relation_no_delete BEFORE DELETE ON ict_provider_relations BEGIN SELECT RAISE(ABORT,'ICT provider relations are append-only'); END;''')
         db.executescript('''CREATE TABLE IF NOT EXISTS client_entities(
           id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
           entity_type TEXT NOT NULL, name TEXT NOT NULL, legal_identifier TEXT NOT NULL,
@@ -546,6 +557,25 @@ def save_dora_assessment(data):
         db.execute("INSERT INTO dora_assessments(id,version,assessment_type,customer_id,counterparty,service_name,scope_description,applicability,criticality,contract_ref,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(assessment_id,version,data["assessment_type"],customer_id,data["counterparty"].strip(),data["service_name"].strip(),data["scope_description"].strip(),data["applicability"],data["criticality"],data["contract_ref"].strip(),data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
         audit(db,"dora_assessment",assessment_id,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"assessment_type":data["assessment_type"],"customer_id":customer_id,"applicability":data["applicability"],"criticality":data["criticality"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
     return next(r for r in dora_assessments() if r["id"]==assessment_id)
+
+def ict_provider_relations(valid_at=None, known_at=None, customer_id=None):
+    with connect() as db:
+        q="SELECT * FROM ict_provider_relations"
+        params=[]
+        if customer_id:
+            q+=" WHERE customer_id=?"; params.append(customer_id)
+        q+=" ORDER BY id,version"
+        rows=db.execute(q,params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_ict_provider_relation(data):
+    stamp=_utc_stamp(data.get("created_at"))
+    rid=data.get("id") or f"IPR-{abs(hash((data['provider'],data['ict_service'])))%100000:05d}"
+    with connect() as db:
+        prev=db.execute("SELECT MAX(version) v FROM ict_provider_relations WHERE id=?",(rid,)).fetchone()["v"]
+        version=(prev or 0)+1
+        db.execute("INSERT INTO ict_provider_relations(id,version,customer_id,provider,ict_service,function_classification,contract_ref,incident_evidence,exit_evidence,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,data.get("customer_id"),data["provider"].strip(),data["ict_service"].strip(),data["function_classification"],data["contract_ref"].strip(),data["incident_evidence"].strip(),data["exit_evidence"].strip(),data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),data["reviewer_role"],data["rationale"].strip(),data["review_date"],stamp,data.get("effective_from"),data.get("effective_to")))
+    return next(r for r in ict_provider_relations() if r["id"]==rid)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
