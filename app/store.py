@@ -66,6 +66,19 @@ def init():
           CREATE TRIGGER IF NOT EXISTS policy_source_reviews_no_delete BEFORE DELETE ON policy_source_reviews BEGIN SELECT RAISE(ABORT,'policy source reviews are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS policy_decisions_no_update BEFORE UPDATE ON policy_decisions BEGIN SELECT RAISE(ABORT,'policy decisions are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS policy_decisions_no_delete BEFORE DELETE ON policy_decisions BEGIN SELECT RAISE(ABORT,'policy decisions are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS client_variants(
+          id TEXT NOT NULL, version INTEGER NOT NULL, control_code TEXT NOT NULL,
+          policy_version INTEGER NOT NULL, client_id TEXT NOT NULL, fund_id TEXT,
+          contractual_requirement TEXT NOT NULL, source_ref TEXT NOT NULL,
+          reconciliation_status TEXT NOT NULL, effective_date TEXT NOT NULL,
+          owner TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          rationale TEXT NOT NULL,
+          PRIMARY KEY(id,version),
+          FOREIGN KEY(control_code,policy_version) REFERENCES policy_controls(control_code,version));
+          CREATE INDEX IF NOT EXISTS client_variant_control ON client_variants(control_code,policy_version);
+          CREATE INDEX IF NOT EXISTS client_variant_client ON client_variants(client_id,id,version);
+          CREATE TRIGGER IF NOT EXISTS client_variants_no_update BEFORE UPDATE ON client_variants BEGIN SELECT RAISE(ABORT,'client variants are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS client_variants_no_delete BEFORE DELETE ON client_variants BEGIN SELECT RAISE(ABORT,'client variants are append-only'); END;''')
         db.executescript('''CREATE TABLE IF NOT EXISTS client_requirements(
           id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
           category TEXT NOT NULL, title TEXT NOT NULL, requirement TEXT NOT NULL,
@@ -629,3 +642,74 @@ def decide_policy(control_code,version,data):
         audit(db,"policy_control",policy["id"],"policy_decision",actor,rationale,{"control_code":control_code,"version":int(version),"decision":decision,"source_review_id":review["id"] if review else None})
     return policies(control_code)
 init()
+
+
+def client_variants(control_code=None, client_id=None):
+    with connect() as db:
+        q="SELECT * FROM client_variants"
+        params=[]
+        conds=[]
+        if control_code:
+            conds.append("control_code=?"); params.append(control_code)
+        if client_id:
+            conds.append("client_id=?"); params.append(client_id)
+        if conds:
+            q+=" WHERE "+" AND ".join(conds)
+        q+=" ORDER BY created_at DESC"
+        rows=db.execute(q,tuple(params)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_client_variant(data):
+    required=("control_code","policy_version","client_id","contractual_requirement","source_ref","reconciliation_status","effective_date","owner","rationale")
+    for key in required:
+        if not str(data.get(key,"")).strip():
+            raise ValueError(f"{key} is verplicht")
+    if data["reconciliation_status"] not in {"configured_match","configuration_gap","unmapped","manual_review"}:
+        # manual reconciliation status may be any non-empty label? accept manual labels too
+        pass
+    # FK check
+    with connect() as db:
+        exists=db.execute("SELECT 1 FROM policy_controls WHERE control_code=? AND version=?", (data["control_code"], int(data["policy_version"]))).fetchone()
+    if not exists:
+        raise ValueError("Policy control versie niet gevonden")
+    variant_id=data.get("id") or str(uuid.uuid4())
+    actor=data.get("actor","demo.client-service").strip() or "demo.client-service"
+    stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM client_variants WHERE id=?",(variant_id,)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO client_variants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (variant_id,version,data["control_code"].strip(),int(data["policy_version"]),data["client_id"].strip(),(data.get("fund_id") or "").strip() or None,
+             data["contractual_requirement"].strip(),data["source_ref"].strip(),data["reconciliation_status"].strip(),
+             data["effective_date"],data["owner"].strip(),actor,stamp,data["rationale"].strip()))
+        audit(db,"client_variant",variant_id,"created" if version==1 else "versioned",actor,data["rationale"],
+            {"control_code":data["control_code"],"version":version,"client_id":data["client_id"],"reconciliation_status":data["reconciliation_status"]})
+    return next(r for r in client_variants() if r["id"]==variant_id and r["version"]==version)
+
+
+def set_reconciliation_status(variant_id, status, actor, rationale):
+    rows=client_variants()
+    current=[r for r in rows if r["id"]==variant_id]
+    if not current:
+        raise ValueError("Variant niet gevonden")
+    current=sorted(current,key=lambda r:r["version"])[-1]
+    data={
+        "id":variant_id,"control_code":current["control_code"],"policy_version":current["policy_version"],
+        "client_id":current["client_id"],"fund_id":current["fund_id"],
+        "contractual_requirement":current["contractual_requirement"],"source_ref":current["source_ref"],
+        "reconciliation_status":status,"effective_date":current["effective_date"],"owner":current["owner"],
+        "rationale":rationale,"actor":actor,
+    }
+    return save_client_variant(data)
+
+
+def client_variant_signals(control_code=None):
+    # non-blocking signals for unapproved interpretations
+    result=[]
+    for v in client_variants(control_code):
+        pols=[p for p in __import__("app.store",fromlist=["x"]).policies(v["control_code"]) if p["version"]==v["policy_version"]]
+        status=pols[0]["validation_status"] if pols else "pending"
+        if status!="validated":
+            result.append({"variant_id":v["id"],"control_code":v["control_code"],"signal":"policy_not_validated","blocking":False})
+    return result
