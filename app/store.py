@@ -266,6 +266,22 @@ def init():
           CREATE INDEX IF NOT EXISTS esg_policy_exceptions_customer ON esg_policy_exceptions(customer_id,profile_id,version);
           CREATE TRIGGER IF NOT EXISTS esg_policy_exceptions_no_update BEFORE UPDATE ON esg_policy_exceptions BEGIN SELECT RAISE(ABORT,'ESG policy exceptions are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS esg_policy_exceptions_no_delete BEFORE DELETE ON esg_policy_exceptions BEGIN SELECT RAISE(ABORT,'ESG policy exceptions are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS esg_manager_selections(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, mandate_ref TEXT,
+          selection_stage TEXT NOT NULL DEFAULT 'onboarding',
+          min_esg_rating TEXT, exclusion_policy TEXT, inclusion_policy TEXT,
+          esg_integration TEXT, climate_nature_human_rights TEXT,
+          impact_targets_3d TEXT, thresholds TEXT,
+          review_moment TEXT, next_review_at TEXT,
+          exception_rationale TEXT, exception_approver TEXT, exception_end_date TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS esg_manager_selections_customer ON esg_manager_selections(customer_id,fund_ref,version);
+          CREATE TRIGGER IF NOT EXISTS esg_manager_selections_no_update BEFORE UPDATE ON esg_manager_selections BEGIN SELECT RAISE(ABORT,'ESG manager selections are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS esg_manager_selections_no_delete BEFORE DELETE ON esg_manager_selections BEGIN SELECT RAISE(ABORT,'ESG manager selections are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -699,6 +715,7 @@ def save_governance_policy(data):
 ESG_POLICY_SUBJECT_TYPES=("fund","mandate","party")
 ESG_POLICY_PRIORITIES=("return","risk","sustainability","balanced")
 ESG_POLICY_IMPACT_FIELDS=("policy_framework","goals","priority","asset_class_scope","assessment_methodology","esg_rating_source","decision_thresholds")
+ESG_MANAGER_SELECTION_STAGES=("onboarding","annual_review","retention_review")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -873,6 +890,61 @@ def esg_policy_change_impact(data):
         "affected_reporting_requirements":affected_reporting,
         "affected_partner_export_profiles":export_profile_refs,
         "unaffected_profile_count":len(profiles)-len(affected)}
+
+def save_esg_manager_selection(data):
+    required=("customer_id","fund_ref","manager_ref","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    stage=data.get("selection_stage") or "onboarding"
+    if stage not in ESG_MANAGER_SELECTION_STAGES: raise ValueError(f"selection_stage moet een van {', '.join(ESG_MANAGER_SELECTION_STAGES)} zijn")
+    exc_end=(data.get("exception_end_date") or "").strip() or None
+    if exc_end:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",exc_end): raise ValueError("exception_end_date moet ISO YYYY-MM-DD")
+        date.fromisoformat(exc_end)
+    if data.get("exception_rationale") and not data.get("exception_approver"):
+        raise ValueError("exception_approver is verplicht bij een uitzondering")
+    if data.get("exception_end_date") and not data.get("exception_rationale"):
+        raise ValueError("exception_rationale is verplicht bij een uitzondering met einddatum")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["manager_ref"]))))
+    pid=data.get("id") or f"esgms-{slug}-{stage}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM esg_manager_selections WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO esg_manager_selections(id,version,customer_id,fund_ref,manager_ref,mandate_ref,
+          selection_stage,min_esg_rating,exclusion_policy,inclusion_policy,esg_integration,
+          climate_nature_human_rights,impact_targets_3d,thresholds,review_moment,next_review_at,
+          exception_rationale,exception_approver,exception_end_date,source_ref,rationale,created_by,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["fund_ref"]).strip(),str(data["manager_ref"]).strip(),
+           (data.get("mandate_ref") or "").strip() or None,stage,
+           (data.get("min_esg_rating") or "").strip() or None,(data.get("exclusion_policy") or "").strip() or None,
+           (data.get("inclusion_policy") or "").strip() or None,(data.get("esg_integration") or "").strip() or None,
+           (data.get("climate_nature_human_rights") or "").strip() or None,
+           (data.get("impact_targets_3d") or "").strip() or None,(data.get("thresholds") or "").strip() or None,
+           (data.get("review_moment") or "").strip() or None,(data.get("next_review_at") or "").strip() or None,
+           (data.get("exception_rationale") or "").strip() or None,(data.get("exception_approver") or "").strip() or None,
+           exc_end,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"esg_manager_selection",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"manager_ref":data["manager_ref"],
+             "selection_stage":stage,"source_ref":data["source_ref"].strip()})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_manager_selections WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def esg_manager_selections(customer_id=None, fund_ref=None, manager_ref=None, valid_at=None):
+    with connect() as db:
+        q="SELECT * FROM esg_manager_selections WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    result=[dict(r) for r in rows]
+    if valid_at:
+        for r in result:
+            r["validity_status"]="active" if (r.get("exception_end_date") is None or r["exception_end_date"]>=valid_at) else "expired"
+    return result
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
