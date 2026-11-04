@@ -6,7 +6,7 @@
 
 ## Tests
 - `tests/test_wtp_raci_dependencies.py`: 8 passed.
-- Full suite: `python3.13 -m pytest -q` → 261 passed, exit 0 (18.84s).
+- Full suite: `python3.13 -m pytest -q` → 269 passed, exit 0 (18.98s).
 
 ## Human gates (recorded, not invented)
 Policy controls CLIENT-PAI-DATA / WTP-TRANSITION-DATA / ICT-DORA-SCOPE pending; PW/BuPW wettelijke interpretatie and fondsspecifieke datalijst/rekenverantwoordelijkheid to be validated by klant, pensioenexpert, Compliance/Legal; SEC-002 validated role matrix and actor separation; ADR-0005 identity/tenant; FactSet tenant/service confirmation.

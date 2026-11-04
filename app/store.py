@@ -353,6 +353,17 @@ def init():
           CREATE INDEX IF NOT EXISTS reporting_executions_customer ON reporting_executions(customer_id,report_ref,version);
           CREATE TRIGGER IF NOT EXISTS reporting_executions_no_update BEFORE UPDATE ON reporting_executions BEGIN SELECT RAISE(ABORT,'reporting executions are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS reporting_executions_no_delete BEFORE DELETE ON reporting_executions BEGIN SELECT RAISE(ABORT,'reporting executions are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS transparency_outputs(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          disclosure_ref TEXT NOT NULL, manager_ref TEXT, data_coverage TEXT,
+          confidentiality_flag TEXT NOT NULL DEFAULT 'confidential', publication_consent TEXT NOT NULL DEFAULT 'pending',
+          publication_scope TEXT, schema_version TEXT, methodology_version TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS transparency_outputs_customer ON transparency_outputs(customer_id,disclosure_ref,version);
+          CREATE TRIGGER IF NOT EXISTS transparency_outputs_no_update BEFORE UPDATE ON transparency_outputs BEGIN SELECT RAISE(ABORT,'transparency outputs are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS transparency_outputs_no_delete BEFORE DELETE ON transparency_outputs BEGIN SELECT RAISE(ABORT,'transparency outputs are append-only'); END;''')
         # WTP-001 Transitieprofiel: fondsregeling/transitiefase, planning, scope, relevante
         # besluit-/go-live-/invaardata en eigenaar. Append-only versieer per fonds.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_transition_profiles(
@@ -378,6 +389,7 @@ def init():
             CREATE INDEX IF NOT EXISTS wtp_raci_dependencies_customer ON wtp_raci_dependencies(customer_id,fund_ref,party_role,version);
             CREATE TRIGGER IF NOT EXISTS wtp_raci_dependencies_no_update BEFORE UPDATE ON wtp_raci_dependencies BEGIN SELECT RAISE(ABORT,'wtp raci dependencies are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS wtp_raci_dependencies_no_delete BEFORE DELETE ON wtp_raci_dependencies BEGIN SELECT RAISE(ABORT,'wtp raci dependencies are append-only'); END;''')
+
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -829,6 +841,8 @@ REPORTING_LANGUAGES=("nl","en","de","fr")
 SUPPLIER_ROLES=("fund","fiduciary","manager","submanager","third_party")
 REPORTING_EXECUTION_STATUSES=("planned","on_track","delivered","delayed","incomplete","failed","recovered","approved")
 REPORTING_ESCALATION_LEVELS=("none","client","compliance","management")
+TRANSPARENCY_CONFIDENTIALITY_FLAGS=("public","confidential","restricted")
+TRANSPARENCY_PUBLICATION_CONSENTS=("granted","denied","pending","not_required")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1400,6 +1414,38 @@ def save_reporting_execution(data):
     with connect() as db: saved=db.execute("SELECT * FROM reporting_executions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(eid,cid)).fetchone()
     return dict(saved)
 
+def transparency_outputs(customer_id=None, disclosure_ref=None, publication_consent=None):
+    with connect() as db:
+        q="SELECT * FROM transparency_outputs WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if disclosure_ref: q+=" AND disclosure_ref=?"; params.append(disclosure_ref)
+        if publication_consent: q+=" AND publication_consent=?"; params.append(publication_consent)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_transparency_output(data):
+    required=("customer_id","disclosure_ref","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    confidentiality=(data.get("confidentiality_flag") or "confidential").strip()
+    if confidentiality not in TRANSPARENCY_CONFIDENTIALITY_FLAGS: raise ValueError(f"confidentiality_flag moet een van {', '.join(TRANSPARENCY_CONFIDENTIALITY_FLAGS)} zijn")
+    consent=(data.get("publication_consent") or "pending").strip()
+    if consent not in TRANSPARENCY_PUBLICATION_CONSENTS: raise ValueError(f"publication_consent moet een van {', '.join(TRANSPARENCY_PUBLICATION_CONSENTS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["disclosure_ref"]))))
+    toid=data.get("id") or f"transp-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM transparency_outputs WHERE id=? AND customer_id=?",(toid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO transparency_outputs(id,version,customer_id,disclosure_ref,manager_ref,data_coverage,confidentiality_flag,publication_consent,publication_scope,schema_version,methodology_version,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (toid,version,cid,data["disclosure_ref"].strip(),(data.get("manager_ref") or "").strip() or None,(data.get("data_coverage") or "").strip() or None,confidentiality,consent,(data.get("publication_scope") or "").strip() or None,(data.get("schema_version") or "").strip() or None,(data.get("methodology_version") or "").strip() or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"transparency_outputs",toid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"disclosure_ref":data["disclosure_ref"],"publication_consent":consent})
+    with connect() as db: saved=db.execute("SELECT * FROM transparency_outputs WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(toid,cid)).fetchone()
+    return dict(saved)
+
 # WTP-001 transitieprofiel: geldige waarden voor de transitiefase.
 WTP_TRANSITION_PHASES=("preparation","decision","migration","golive","aftercare","closed")
 
@@ -1434,6 +1480,7 @@ def save_wtp_transition_profile(data):
         audit(db,"wtp_transition_profiles",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"transition_phase":data["transition_phase"]})
     with connect() as db: saved=db.execute("SELECT * FROM wtp_transition_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+
     return dict(saved)
 
 # WTP-002 RACI en afhankelijkheden: geldige partijrollen.
