@@ -300,6 +300,17 @@ def init():
         db.executescript("CREATE TABLE IF NOT EXISTS esg_due_diligence_dossiers(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, workflow_step TEXT NOT NULL, impact_priority TEXT NOT NULL DEFAULT 'medium', finding TEXT NOT NULL, human_judgement TEXT NOT NULL, action_owner TEXT NOT NULL, deadline TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_due_diligence_dossiers_customer ON esg_due_diligence_dossiers(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_update BEFORE UPDATE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_delete BEFORE DELETE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END;")
         db.executescript("CREATE TABLE IF NOT EXISTS esg_engagement_incidents(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, incident TEXT NOT NULL, source_ref TEXT NOT NULL, severity TEXT NOT NULL, engagement_relation TEXT NOT NULL, engagement_goal TEXT NOT NULL, progress TEXT NOT NULL DEFAULT 'open', actions TEXT, remediation TEXT, closure TEXT, retention_decision TEXT NOT NULL DEFAULT 'pending', rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_engagement_incidents_customer ON esg_engagement_incidents(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_update BEFORE UPDATE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_delete BEFORE DELETE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END;")
         db.executescript("CREATE TABLE IF NOT EXISTS esg_periodic_reviews(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, review_period TEXT NOT NULL DEFAULT 'annual', esg_risks TEXT NOT NULL, results TEXT NOT NULL, improvement_actions TEXT, deviation TEXT NOT NULL DEFAULT 'none', deviation_rationale TEXT, approver TEXT, end_date TEXT, escalation TEXT NOT NULL DEFAULT 'none', source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_periodic_reviews_customer ON esg_periodic_reviews(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_periodic_reviews_no_update BEFORE UPDATE ON esg_periodic_reviews BEGIN SELECT RAISE(ABORT,'ESG periodic reviews are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_periodic_reviews_no_delete BEFORE DELETE ON esg_periodic_reviews BEGIN SELECT RAISE(ABORT,'ESG periodic reviews are append-only'); END;")
+        db.executescript('''CREATE TABLE IF NOT EXISTS reporting_catalog(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          report_type TEXT NOT NULL, data_item TEXT NOT NULL, definition TEXT NOT NULL, unit TEXT NOT NULL,
+          perimeter TEXT NOT NULL, scope TEXT, calculation_source TEXT NOT NULL,
+          frequency TEXT NOT NULL, deadline TEXT, language TEXT NOT NULL DEFAULT 'nl',
+          template_ref TEXT, recipients TEXT NOT NULL, schema_version TEXT, methodology_version TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS reporting_catalog_customer ON reporting_catalog(customer_id,report_type,version);
+          CREATE TRIGGER IF NOT EXISTS reporting_catalog_no_update BEFORE UPDATE ON reporting_catalog BEGIN SELECT RAISE(ABORT,'reporting catalog is append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS reporting_catalog_no_delete BEFORE DELETE ON reporting_catalog BEGIN SELECT RAISE(ABORT,'reporting catalog is append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -745,6 +756,10 @@ ESG_REVIEW_PERIODS=("annual","client_agreed")
 ESG_REVIEW_DEVIATIONS=("none","deviation","deferral")
 ESG_REVIEW_ESCALATIONS=("none","escalated")
 
+REPORTING_TYPES=("regulatory","client","internal","pai_sfdr","wtp","dora")
+REPORTING_FREQUENCIES=("monthly","quarterly","semiannual","annual","ad_hoc","event_driven")
+REPORTING_LANGUAGES=("nl","en","de","fr")
+
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
     known_at=_utc_stamp(known_at or now())
@@ -1156,6 +1171,40 @@ def esg_periodic_reviews(customer_id=None, fund_ref=None, manager_ref=None, revi
         for r in result:
             r["validity_status"]="active" if r["deviation"]!="deferral" else "deferred"
     return result
+
+def save_reporting_catalog_item(data):
+    required=("customer_id","report_type","data_item","definition","unit","perimeter","calculation_source","frequency","recipients","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["report_type"] not in REPORTING_TYPES: raise ValueError(f"report_type moet een van {', '.join(REPORTING_TYPES)} zijn")
+    if data["frequency"] not in REPORTING_FREQUENCIES: raise ValueError(f"frequency moet een van {', '.join(REPORTING_FREQUENCIES)} zijn")
+    language=(data.get("language") or "nl").strip()
+    if language not in REPORTING_LANGUAGES: raise ValueError(f"language moet een van {', '.join(REPORTING_LANGUAGES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["report_type"]),str(data["data_item"]))))
+    pid=data.get("id") or f"rpt-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    recipients=data["recipients"]
+    if isinstance(recipients,(list,tuple)): recipients=json.dumps(recipients)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM reporting_catalog WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO reporting_catalog(id,version,customer_id,report_type,data_item,definition,unit,perimeter,scope,calculation_source,frequency,deadline,language,template_ref,recipients,schema_version,methodology_version,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["report_type"]).strip(),data["data_item"].strip(),data["definition"].strip(),data["unit"].strip(),data["perimeter"].strip(),(data.get("scope") or "").strip() or None,data["calculation_source"].strip(),data["frequency"].strip(),(data.get("deadline") or "").strip() or None,language,(data.get("template_ref") or "").strip() or None,recipients,(data.get("schema_version") or "").strip() or None,(data.get("methodology_version") or "").strip() or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"reporting_catalog",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"report_type":data["report_type"],"data_item":data["data_item"],"frequency":data["frequency"]})
+    with connect() as db: saved=db.execute("SELECT * FROM reporting_catalog WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def reporting_catalog_items(customer_id=None, report_type=None, frequency=None):
+    with connect() as db:
+        q="SELECT * FROM reporting_catalog WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if report_type: q+=" AND report_type=?"; params.append(report_type)
+        if frequency: q+=" AND frequency=?"; params.append(frequency)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
