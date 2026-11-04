@@ -311,6 +311,15 @@ def init():
           CREATE INDEX IF NOT EXISTS reporting_catalog_customer ON reporting_catalog(customer_id,report_type,version);
           CREATE TRIGGER IF NOT EXISTS reporting_catalog_no_update BEFORE UPDATE ON reporting_catalog BEGIN SELECT RAISE(ABORT,'reporting catalog is append-only'); END;
           CREATE TRIGGER IF NOT EXISTS reporting_catalog_no_delete BEFORE DELETE ON reporting_catalog BEGIN SELECT RAISE(ABORT,'reporting catalog is append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS data_delivery_agreements(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          supplier_ref TEXT NOT NULL, supplier_role TEXT NOT NULL, field TEXT NOT NULL, period TEXT NOT NULL,
+          channel TEXT NOT NULL, validation TEXT NOT NULL, proof TEXT NOT NULL,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS data_delivery_agreements_customer ON data_delivery_agreements(customer_id,supplier_role,version);
+          CREATE TRIGGER IF NOT EXISTS data_delivery_agreements_no_update BEFORE UPDATE ON data_delivery_agreements BEGIN SELECT RAISE(ABORT,'data delivery agreements are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS data_delivery_agreements_no_delete BEFORE DELETE ON data_delivery_agreements BEGIN SELECT RAISE(ABORT,'data delivery agreements are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -759,6 +768,7 @@ ESG_REVIEW_ESCALATIONS=("none","escalated")
 REPORTING_TYPES=("regulatory","client","internal","pai_sfdr","wtp","dora")
 REPORTING_FREQUENCIES=("monthly","quarterly","semiannual","annual","ad_hoc","event_driven")
 REPORTING_LANGUAGES=("nl","en","de","fr")
+SUPPLIER_ROLES=("fund","fiduciary","manager","submanager","third_party")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1205,6 +1215,34 @@ def reporting_catalog_items(customer_id=None, report_type=None, frequency=None):
         if frequency: q+=" AND frequency=?"; params.append(frequency)
         rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
     return [dict(r) for r in rows]
+def data_delivery_agreements(customer_id=None, supplier_role=None, field=None):
+    with connect() as db:
+        q="SELECT * FROM data_delivery_agreements WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if supplier_role: q+=" AND supplier_role=?"; params.append(supplier_role)
+        if field: q+=" AND field=?"; params.append(field)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_data_delivery_agreement(data):
+    required=("customer_id","supplier_ref","supplier_role","field","period","channel","validation","proof","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["supplier_role"] not in SUPPLIER_ROLES: raise ValueError(f"supplier_role moet een van {', '.join(SUPPLIER_ROLES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["supplier_role"]),str(data["field"]),str(data["period"]))))
+    pid=data.get("id") or f"dda-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM data_delivery_agreements WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO data_delivery_agreements(id,version,customer_id,supplier_ref,supplier_role,field,period,channel,validation,proof,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["supplier_ref"].strip(),data["supplier_role"].strip(),data["field"].strip(),data["period"].strip(),data["channel"].strip(),data["validation"].strip(),data["proof"].strip(),data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"data_delivery_agreements",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"supplier_role":data["supplier_role"],"field":data["field"],"period":data["period"]})
+    with connect() as db: saved=db.execute("SELECT * FROM data_delivery_agreements WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
