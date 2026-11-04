@@ -454,6 +454,19 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS fee_calc_rules_customer ON fee_calculation_rules(customer_id,fund_ref,rule_name,version);
             CREATE TRIGGER IF NOT EXISTS fee_calc_rules_no_update BEFORE UPDATE ON fee_calculation_rules BEGIN SELECT RAISE(ABORT,'fee calculation rules are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS fee_calc_rules_no_delete BEFORE DELETE ON fee_calculation_rules BEGIN SELECT RAISE(ABORT,'fee calculation rules are append-only'); END;''')
+        # FEE-004 Externe managerlijst/look-through
+        db.executescript('''CREATE TABLE IF NOT EXISTS manager_look_through(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            manager_ref TEXT NOT NULL, fund_ref TEXT NOT NULL, vehicle_ref TEXT,
+            mandate_ref TEXT, asset_class TEXT NOT NULL, aum REAL,
+            coverage_date TEXT NOT NULL, disclosure_permission TEXT NOT NULL,
+            data_coverage TEXT, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS manager_look_through_customer ON manager_look_through(customer_id,manager_ref,fund_ref,version);
+            CREATE TRIGGER IF NOT EXISTS manager_look_through_no_update BEFORE UPDATE ON manager_look_through BEGIN SELECT RAISE(ABORT,'manager look-through is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS manager_look_through_no_delete BEFORE DELETE ON manager_look_through BEGIN SELECT RAISE(ABORT,'manager look-through is append-only'); END;''')
         # FEE-003 Kostenoverzicht
         db.executescript('''CREATE TABLE IF NOT EXISTS cost_overview(
             id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -1822,6 +1835,7 @@ def fee_calculation_rules_export(customer_id=None, fund_ref=None):
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},"coverage":len(rows),"rows":rows}
 
 COST_OVERVIEW_TYPES=("direct_fee","performance_fee","other_agreed")
+DISCLOSURE_PERMISSIONS=("permitted","restricted","prohibited")
 PERIMETERS=("client","mandate","product")
 
 def save_cost_overview(data):
@@ -1865,10 +1879,50 @@ def cost_overview_export(customer_id=None, fund_ref=None, perimeter=None):
     rows=cost_overview(customer_id=customer_id,fund_ref=fund_ref,perimeter=perimeter)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref,"perimeter":perimeter},"coverage":len(rows),"rows":rows}
 
+def save_manager_look_through(data):
+    required=("customer_id","manager_ref","fund_ref","asset_class","coverage_date","disclosure_permission","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["disclosure_permission"] not in DISCLOSURE_PERMISSIONS: raise ValueError(f"disclosure_permission moet een van {', '.join(DISCLOSURE_PERMISSIONS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["manager_ref"]),str(data["fund_ref"]),str(data["asset_class"]),str(data["coverage_date"]))))
+    pid=data.get("id") or f"mgrlt-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k); return (str(v).strip() if v is not None else None) or None
+    def optf(k):
+        v=data.get(k)
+        if v is None or v=="": return None
+        return float(v)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM manager_look_through WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO manager_look_through(id,version,customer_id,manager_ref,fund_ref,vehicle_ref,mandate_ref,asset_class,aum,coverage_date,disclosure_permission,data_coverage,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["manager_ref"].strip(),data["fund_ref"].strip(),opt("vehicle_ref"),opt("mandate_ref"),data["asset_class"].strip(),optf("aum"),data["coverage_date"].strip(),data["disclosure_permission"].strip(),opt("data_coverage"),data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"manager_look_through",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),{"customer_id":cid,"version":version,"manager_ref":data["manager_ref"],"disclosure_permission":data["disclosure_permission"]})
+    with connect() as db: saved=db.execute("SELECT * FROM manager_look_through WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def manager_look_through(customer_id=None, manager_ref=None, fund_ref=None, disclosure_permission=None):
+    with connect() as db:
+        q="SELECT * FROM manager_look_through WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if disclosure_permission: q+=" AND disclosure_permission=?"; params.append(disclosure_permission)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def manager_look_through_export(customer_id=None, manager_ref=None, fund_ref=None):
+    rows=manager_look_through(customer_id=customer_id,manager_ref=manager_ref,fund_ref=fund_ref)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"manager_ref":manager_ref,"fund_ref":fund_ref},"coverage":len(rows),"rows":rows}
+
+
 def fee_components_export(customer_id=None, fund_ref=None):
     rows=fee_components(customer_id=customer_id,fund_ref=fund_ref)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},
-            "coverage":len(rows),"rows":rows}
+           "coverage":len(rows),"rows":rows}
 wtp_risk_controls = wtp_risks
 save_wtp_risk_control = save_wtp_risk
 wtp_changes = wtp_risks
