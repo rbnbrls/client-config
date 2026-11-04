@@ -34,7 +34,9 @@ def init():
         CREATE TRIGGER IF NOT EXISTS config_knowledge_no_update BEFORE UPDATE ON config_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'config knowledge snapshots are append-only'); END;
         CREATE TRIGGER IF NOT EXISTS config_knowledge_no_delete BEFORE DELETE ON config_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'config knowledge snapshots are append-only'); END;
         CREATE TABLE IF NOT EXISTS change_sets(id TEXT PRIMARY KEY,title TEXT NOT NULL,customer_id TEXT NOT NULL REFERENCES customers(id),base_version INTEGER NOT NULL,patch TEXT NOT NULL,effective_date TEXT NOT NULL,rationale TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL,simulation TEXT,approved_by TEXT,approved_at TEXT,activated_at TEXT,schema_version TEXT NOT NULL DEFAULT '1');
-        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,details TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT,entity_type TEXT NOT NULL,entity_id TEXT NOT NULL,action TEXT NOT NULL,actor TEXT NOT NULL,reason TEXT NOT NULL,at TEXT NOT NULL,details TEXT NOT NULL,old_value TEXT,new_value TEXT,evidence TEXT,policy_version TEXT,schema_version TEXT,simulation TEXT,approval TEXT,activation TEXT,publication_status TEXT);
+        CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit BEGIN SELECT RAISE(ABORT,'audit records are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit BEGIN SELECT RAISE(ABORT,'audit records are append-only'); END;
         CREATE TABLE IF NOT EXISTS partner_profiles(id TEXT PRIMARY KEY,name TEXT NOT NULL,schema_version TEXT NOT NULL,mapping TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS exports(id TEXT PRIMARY KEY,customer_id TEXT NOT NULL,config_version INTEGER NOT NULL,profile_id TEXT NOT NULL,schema_version TEXT NOT NULL,checksum TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,created_by TEXT NOT NULL,created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS config_schema_versions(version INTEGER PRIMARY KEY,schema_id TEXT NOT NULL,title TEXT NOT NULL,owner TEXT NOT NULL,effective_from TEXT NOT NULL,recorded_at TEXT NOT NULL,schema_json TEXT NOT NULL,created_by TEXT NOT NULL,rationale TEXT NOT NULL);
@@ -130,6 +132,10 @@ def init():
         if "schema_version" not in config_columns: db.execute("ALTER TABLE config_versions ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
         change_columns={r["name"] for r in db.execute("PRAGMA table_info(change_sets)")}
         if "schema_version" not in change_columns: db.execute("ALTER TABLE change_sets ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
+        # AUD-001: audit-uitbreidingen append-only migreren (add-only, geen verwijdering).
+        audit_columns={r["name"] for r in db.execute("PRAGMA table_info(audit)")}
+        for col,ddl in (("old_value","TEXT"),("new_value","TEXT"),("evidence","TEXT"),("policy_version","TEXT"),("schema_version","TEXT"),("simulation","TEXT"),("approval","TEXT"),("activation","TEXT"),("publication_status","TEXT")):
+            if col not in audit_columns: db.execute(f"ALTER TABLE audit ADD COLUMN {col} {ddl}")
         seed_configuration_schemas(db)
         if not db.execute("SELECT 1 FROM customers LIMIT 1").fetchone(): seed(db)
         if not db.execute("SELECT 1 FROM policy_controls LIMIT 1").fetchone(): seed_policies(db)
@@ -232,7 +238,13 @@ def customers():
     with connect() as db: ids=db.execute("SELECT id FROM customers ORDER BY name").fetchall()
     return [customer(r["id"]) for r in ids]
 
-def audit(db,typ,eid,action,actor,reason,details): db.execute("INSERT INTO audit(entity_type,entity_id,action,actor,reason,at,details) VALUES(?,?,?,?,?,?,?)",(typ,eid,action,actor,reason,now(),json.dumps(details)))
+def audit(db,typ,eid,action,actor,reason,details,old_value=None,new_value=None,evidence=None,policy_version=None,schema_version=None,simulation=None,approval=None,activation=None,publication_status=None):
+    """AUD-001: append-only auditlegging — actor, actie, tijd, oude/nieuwe waarde,
+    reden, bronbewijs, policy-/schema-versie, simulatie, goedkeuring, activatie
+    en export/publicatiestatus. Geen updates of deletes: zie audit_no_update/audit_no_delete."""
+    dump=lambda v: json.dumps(v) if isinstance(v,(dict,list)) else v
+    db.execute("INSERT INTO audit(entity_type,entity_id,action,actor,reason,at,details,old_value,new_value,evidence,policy_version,schema_version,simulation,approval,activation,publication_status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (typ,eid,action,actor,reason,now(),json.dumps(details),dump(old_value),dump(new_value),evidence,policy_version,schema_version,dump(simulation),dump(approval),dump(activation),publication_status))
 def change(cid):
     with connect() as db: row=db.execute("SELECT * FROM change_sets WHERE id=?",(cid,)).fetchone()
     if not row:return None
@@ -265,7 +277,14 @@ def create_change(d):
     if not reason: raise ValueError("Onderbouwing is verplicht")
     with connect() as db:
         db.execute("INSERT INTO change_sets(id,title,customer_id,base_version,patch,effective_date,rationale,status,created_by,created_at,simulation,approved_by,approved_at,activated_at,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,d.get("title") or "Configuratiewijziging",d["customer_id"],base["version"],json.dumps(patch),d["effective_date"],reason,"draft",actor,now(),None,None,None,None,schema_version))
-        audit(db,"change_set",cid,"created",actor,reason,{"base_version":base["version"],"patch":patch,"schema_version":schema_version})
+        old_values={p:None for p in patch}
+        for p in patch:
+            keys=p.split("."); cur=json.loads(json.dumps(base["payload"]))
+            try:
+                for k in keys[:-1]: cur=cur[int(k)] if isinstance(cur,list) else cur[k]
+                old_values[p]=cur[int(keys[-1])] if isinstance(cur,list) and keys[-1].isdigit() else cur[keys[-1]]
+            except (KeyError,IndexError,TypeError,ValueError): old_values[p]=None
+        audit(db,"change_set",cid,"created",actor,reason,{"base_version":base["version"],"patch":patch,"schema_version":schema_version},old_value=old_values,new_value=patch,evidence=reason,schema_version=schema_version)
     return change(cid)
 def simulate(cid,inputs):
     item=change(cid)
@@ -274,7 +293,7 @@ def simulate(cid,inputs):
     aum=float(inputs.get("aum_eur",250_000_000)); old=payload["fees"]["bps"]; new=p.get("fees.bps",old)
     result={"as_of":item["effective_date"],"baseline_version":item["base_version"],"schema_version":item.get("schema_version",base.get("schema_version","1")),"annual_fee_baseline_eur":round(aum*old/10000,2),"annual_fee_scenario_eur":round(aum*float(new)/10000,2),"annual_fee_delta_eur":fee_delta(aum,old,new)/100,"aum_input_eur":aum,"assumptions":["AUM is handmatige scenario-input","Annualized; tiers, minimum fee, FX and performance fees excluded in this MVP"],"operational":["Rapportage- en capaciteitseffecten zijn nog niet doorgerekend"],"compliance":[{"severity":"review","code":"HUMAN_REVIEW_REQUIRED","message":"Beoordeel klantimpact, eerlijke behandeling en toepasselijke beleidsregels; te valideren door Compliance/Legal."}],"affected":["Klantconfiguratie","Mandaat fees" if new!=old else "Mandaat"],"reproducibility":{"engine":"domain-v1","input":{"aum_eur":aum},"change_set":cid}}
     with connect() as db:
-        db.execute("UPDATE change_sets SET simulation=?,status='simulated' WHERE id=?",(json.dumps(result),cid)); audit(db,"change_set",cid,"simulated",inputs.get("actor","demo.user"),"Impactanalyse",result)
+        db.execute("UPDATE change_sets SET simulation=?,status='simulated' WHERE id=?",(json.dumps(result),cid)); audit(db,"change_set",cid,"simulated",inputs.get("actor","demo.user"),"Impactanalyse",result,simulation=result,schema_version=result.get("schema_version"),evidence="change_set simulation engine domain-v1")
     return result
 def approve(cid,d):
     item=change(cid)
@@ -282,7 +301,7 @@ def approve(cid,d):
     actor=d.get("actor","demo.approver")
     if actor==item["created_by"]:raise ValueError("Initiator kan niet zelf goedkeuren (vier-ogen-principe)")
     with connect() as db:
-        db.execute("UPDATE change_sets SET status='approved',approved_by=?,approved_at=? WHERE id=?",(actor,now(),cid)); audit(db,"change_set",cid,"approved",actor,d.get("reason","Goedgekeurd"),{"simulation":item["simulation"]})
+        db.execute("UPDATE change_sets SET status='approved',approved_by=?,approved_at=? WHERE id=?",(actor,now(),cid)); audit(db,"change_set",cid,"approved",actor,d.get("reason","Goedgekeurd"),{"simulation":item["simulation"]},approval={"approved_by":actor,"approved_at":now()},simulation=item["simulation"],schema_version=item.get("schema_version"),evidence=d.get("evidence") or d.get("reason","Goedgekeurd"))
     return change(cid)
 def activate(cid,d):
     item=change(cid)
@@ -308,7 +327,7 @@ def activate(cid,d):
         validation=validate_configuration(payload,schema_version)
         if not validation["valid"]: raise ValueError("Configuratie voldoet niet aan schema v"+schema_version+": "+"; ".join(f"{e['path']}: {e['message']}" for e in validation["errors"]))
         db.execute("INSERT INTO config_versions(id,customer_id,version,valid_from,valid_to,recorded_from,recorded_to,payload,change_id,schema_version) VALUES(?,?,?,?,?,?,?,?,?,?)",(str(uuid.uuid4()),item["customer_id"],old["version"]+1,item["effective_date"],old["valid_to"],stamp,None,json.dumps(payload),cid,schema_version))
-        db.execute("UPDATE change_sets SET status='active',activated_at=? WHERE id=?",(stamp,cid)); audit(db,"change_set",cid,"activated",d.get("actor","demo.operator"),d.get("reason","Geactiveerd"),{"new_version":old["version"]+1,"schema_version":schema_version})
+        db.execute("UPDATE change_sets SET status='active',activated_at=? WHERE id=?",(stamp,cid)); audit(db,"change_set",cid,"activated",d.get("actor","demo.operator"),d.get("reason","Geactiveerd"),{"new_version":old["version"]+1,"schema_version":schema_version},activation={"new_version":old["version"]+1,"activated_at":stamp},schema_version=schema_version,evidence=d.get("evidence") or d.get("reason","Geactiveerd"))
         snapshot_config_knowledge(db,item["customer_id"],d.get("actor","demo.operator"),d.get("reason","Geactiveerd"),stamp)
     return change(cid)
 def profiles():
@@ -324,11 +343,19 @@ def export_config(cid,profile_id,actor="demo.publisher",valid_at=None):
     body={"metadata":{"customer_id":cid,"config_version":cfg["version"],"configuration_schema_version":cfg.get("schema_version","1"),"schema_version":profile["schema_version"],"profile":profile_id,"generated_at":now()},"configuration":{"customer":{"name":cfg["name"],"type":cfg["kind"],"jurisdiction":cfg["jurisdiction"]},**cfg["payload"]}}
     serialized=json.dumps(body,sort_keys=True,separators=(",",":")); checksum=hashlib.sha256(serialized.encode()).hexdigest(); eid=str(uuid.uuid4())
     with connect() as db:
-        db.execute("INSERT INTO exports VALUES(?,?,?,?,?,?,?,?,?,?)",(eid,cid,cfg["version"],profile_id,profile["schema_version"],checksum,serialized,"generated",actor,now())); audit(db,"export",eid,"generated",actor,"Partnerconfiguratie-export",{"customer_id":cid,"profile":profile_id,"checksum":checksum})
+        db.execute("INSERT INTO exports VALUES(?,?,?,?,?,?,?,?,?,?)",(eid,cid,cfg["version"],profile_id,profile["schema_version"],checksum,serialized,"generated",actor,now())); audit(db,"export",eid,"generated",actor,"Partnerconfiguratie-export",{"customer_id":cid,"profile":profile_id,"checksum":checksum},publication_status="generated",evidence=checksum,schema_version=profile["schema_version"])
     return {"export_id":eid,"checksum":checksum,"filename":f"{cid}-v{cfg['version']}-{eid[:8]}.json","payload":body}
 def audit_log(limit=100):
     with connect() as db: rows=db.execute("SELECT * FROM audit ORDER BY at DESC LIMIT ?",(limit,)).fetchall()
-    return [{**dict(r),"details":json.loads(r["details"])} for r in rows]
+    out=[]
+    for r in rows:
+        row={**dict(r),"details":json.loads(r["details"])}
+        for k in ("old_value","new_value","simulation","approval","activation"):
+            if isinstance(row.get(k),str):
+                try: row[k]=json.loads(row[k])
+                except ValueError: pass
+        out.append(row)
+    return out
 
 def _config_value(payload,path):
     if not path:return None
@@ -640,7 +667,7 @@ def save_policy(data, control_code=None):
         if not control_code and previous is not None: raise ValueError("Controlcode bestaat al; maak een nieuwe versie")
         version=(previous or 0)+1; stamp=now(); record_id=str(uuid.uuid4())
         db.execute("INSERT INTO policy_controls VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(record_id,code,version,data["title"].strip(),data["owner"].strip(),data["audience"].strip(),data["source_ref"].strip(),data["applicability"].strip(),enforcement,data["effective_date"],data["review_date"],status,evidence,actor,stamp,note))
-        audit(db,"policy_control",record_id,"created" if version==1 else "versioned",actor,note,{"control_code":code,"version":version,"validation_status":status,"enforcement":enforcement})
+        audit(db,"policy_control",record_id,"created" if version==1 else "versioned",actor,note,{"control_code":code,"version":version,"validation_status":status,"enforcement":enforcement},policy_version=str(version),evidence=note)
     return policies(code)[0]
 
 def policy_source_reviews(control_code,version):
@@ -688,7 +715,7 @@ def decide_policy(control_code,version,data):
     decision_id=str(uuid.uuid4()); stamp=now()
     with connect() as db:
         db.execute("INSERT INTO policy_decisions VALUES(?,?,?,?,?,?,?,?,?)",(decision_id,control_code,int(version),review["id"] if review else None,decision,actor,role,rationale,stamp))
-        audit(db,"policy_control",policy["id"],"policy_decision",actor,rationale,{"control_code":control_code,"version":int(version),"decision":decision,"source_review_id":review["id"] if review else None})
+        audit(db,"policy_control",policy["id"],"policy_decision",actor,rationale,{"control_code":control_code,"version":int(version),"decision":decision,"source_review_id":review["id"] if review else None},policy_version=str(int(version)),evidence=review["id"] if review else rationale)
     return policies(control_code)
 init()
 
