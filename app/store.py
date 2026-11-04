@@ -320,6 +320,17 @@ def init():
           CREATE INDEX IF NOT EXISTS data_delivery_agreements_customer ON data_delivery_agreements(customer_id,supplier_role,version);
           CREATE TRIGGER IF NOT EXISTS data_delivery_agreements_no_update BEFORE UPDATE ON data_delivery_agreements BEGIN SELECT RAISE(ABORT,'data delivery agreements are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS data_delivery_agreements_no_delete BEFORE DELETE ON data_delivery_agreements BEGIN SELECT RAISE(ABORT,'data delivery agreements are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS sfdr_pai_profiles(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          profile_name TEXT NOT NULL, pai_indicators TEXT NOT NULL, reference_period TEXT NOT NULL,
+          reporting_frequency TEXT NOT NULL, methodology TEXT NOT NULL, data_coverage TEXT NOT NULL,
+          missing_data_reason TEXT NOT NULL, assurance TEXT NOT NULL, responsibility TEXT NOT NULL,
+          applicability_decision_ref TEXT NOT NULL, schema_version TEXT, methodology_version TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS sfdr_pai_profiles_customer ON sfdr_pai_profiles(customer_id,profile_name,version);
+          CREATE TRIGGER IF NOT EXISTS sfdr_pai_profiles_no_update BEFORE UPDATE ON sfdr_pai_profiles BEGIN SELECT RAISE(ABORT,'sfdr pai profiles are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS sfdr_pai_profiles_no_delete BEFORE DELETE ON sfdr_pai_profiles BEGIN SELECT RAISE(ABORT,'sfdr pai profiles are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -1242,6 +1253,37 @@ def save_data_delivery_agreement(data):
         audit(db,"data_delivery_agreements",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"supplier_role":data["supplier_role"],"field":data["field"],"period":data["period"]})
     with connect() as db: saved=db.execute("SELECT * FROM data_delivery_agreements WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def sfdr_pai_profiles(customer_id=None, profile_name=None, responsibility=None):
+    with connect() as db:
+        q="SELECT * FROM sfdr_pai_profiles WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if profile_name: q+=" AND profile_name=?"; params.append(profile_name)
+        if responsibility: q+=" AND responsibility=?"; params.append(responsibility)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_sfdr_pai_profile(data):
+    required=("customer_id","profile_name","pai_indicators","reference_period","reporting_frequency","methodology","data_coverage","missing_data_reason","assurance","responsibility","applicability_decision_ref","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["reporting_frequency"] not in REPORTING_FREQUENCIES: raise ValueError(f"reporting_frequency moet een van {', '.join(REPORTING_FREQUENCIES)} zijn")
+    indicators=data["pai_indicators"]
+    if isinstance(indicators,(list,tuple)): indicators=json.dumps(indicators)
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["profile_name"]))))
+    pid=data.get("id") or f"sfdr-pai-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM sfdr_pai_profiles WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO sfdr_pai_profiles(id,version,customer_id,profile_name,pai_indicators,reference_period,reporting_frequency,methodology,data_coverage,missing_data_reason,assurance,responsibility,applicability_decision_ref,schema_version,methodology_version,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["profile_name"].strip(),indicators,data["reference_period"].strip(),data["reporting_frequency"].strip(),data["methodology"].strip(),data["data_coverage"].strip(),data["missing_data_reason"].strip(),data["assurance"].strip(),data["responsibility"].strip(),data["applicability_decision_ref"].strip(),(data.get("schema_version") or "").strip() or None,(data.get("methodology_version") or "").strip() or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"sfdr_pai_profiles",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"profile_name":data["profile_name"],"reporting_frequency":data["reporting_frequency"]})
+    with connect() as db: saved=db.execute("SELECT * FROM sfdr_pai_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
