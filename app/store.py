@@ -173,6 +173,20 @@ def init():
           CREATE INDEX IF NOT EXISTS chain_tasks_customer ON chain_tasks(customer_id,party_id,version);
           CREATE TRIGGER IF NOT EXISTS chain_tasks_no_update BEFORE UPDATE ON chain_tasks BEGIN SELECT RAISE(ABORT,'chain tasks are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS chain_tasks_no_delete BEFORE DELETE ON chain_tasks BEGIN SELECT RAISE(ABORT,'chain tasks are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS contract_minimums(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          contract_ref TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT,
+          liability TEXT, transfer_of_rights TEXT, subcontracting TEXT,
+          info_exchange TEXT, monitoring TEXT, audit_rights TEXT,
+          supervisor_access TEXT, evaluation TEXT, term TEXT,
+          exit_continuity TEXT, detailed_costs TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS contract_minimums_customer ON contract_minimums(customer_id,contract_ref,version);
+          CREATE TRIGGER IF NOT EXISTS contract_minimums_no_update BEFORE UPDATE ON contract_minimums BEGIN SELECT RAISE(ABORT,'contract minimums are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS contract_minimums_no_delete BEFORE DELETE ON contract_minimums BEGIN SELECT RAISE(ABORT,'contract minimums are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -1150,3 +1164,50 @@ def complete_chain_task(task_id,customer_id,evidence,actor=None):
         if task["status"]=="completed": raise ValueError("Meldingtaak is al afgerond; append-only, registreer een nieuwe taak of herziening")
     new=dict(task); new.update({"status":"completed","completion_evidence":str(evidence).strip(),"rationale":f"Afronding: {task['rationale']}","actor":actor or task["created_by"]})
     return save_chain_task({k:v for k,v in new.items() if k!="version"})
+
+CONTRACT_MINIMUM_FIELDS = ("liability","transfer_of_rights","subcontracting","info_exchange","monitoring","audit_rights","supervisor_access","evaluation","term","exit_continuity","detailed_costs")
+
+def missing_contract_fields(data):
+    return [f for f in CONTRACT_MINIMUM_FIELDS if not data.get(f)]
+
+def contract_minimums(customer_id=None,contract_ref=None,known_at=None):
+    known_stamp=_utc_stamp(known_at or now())
+    with connect() as db:
+        q="SELECT * FROM contract_minimums WHERE created_at<=?"
+        params=[known_stamp]
+        if customer_id:
+            q+=" AND customer_id=?"; params.append(customer_id)
+        if contract_ref:
+            q+=" AND contract_ref=?"; params.append(contract_ref)
+        rows=db.execute(q,params).fetchall()
+    grouped={}
+    for row in rows:
+        item=dict(row)
+        prior=grouped.get(item["id"])
+        if not prior or item["version"]>prior["version"]: grouped[item["id"]]=item
+    return list(grouped.values())
+
+def save_contract_minimum(data):
+    required=("customer_id","contract_ref","subject_type","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["subject_type"] not in ("contract","party","mandate","activity"): raise ValueError("subject_type moet contract, party, mandate of activity zijn")
+    cid=data["customer_id"]
+    mid=data.get("id") or "cm-"+re.sub(r"[^a-z0-9]+","-",str(data["contract_ref"]).lower()).strip("-")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM contract_minimums WHERE id=? AND customer_id=?",(mid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now(); actor=data.get("actor","demo.client-service").strip()
+        db.execute("INSERT INTO contract_minimums VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (mid,version,cid,str(data["contract_ref"]).strip(),str(data["subject_type"]).strip(),data.get("subject_id"),
+             data.get("liability"),data.get("transfer_of_rights"),data.get("subcontracting"),
+             data.get("info_exchange"),data.get("monitoring"),data.get("audit_rights"),
+             data.get("supervisor_access"),data.get("evaluation"),data.get("term"),
+             data.get("exit_continuity"),data.get("detailed_costs"),
+             str(data["source_ref"]).strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"contract_minimums",mid,"created" if version==1 else "versioned",actor,data["rationale"],
+            {"customer_id":cid,"version":version,"contract_ref":data["contract_ref"],"subject_type":data["subject_type"],
+             "missing":missing_contract_fields(data)})
+    with connect() as db: saved=db.execute("SELECT * FROM contract_minimums WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(mid,cid)).fetchone()
+    return dict(saved)
