@@ -149,4 +149,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:return self.send_json({"error":str(e)},500)
     def log_message(self,fmt,*args):print("%s - %s"%(self.address_string(),fmt%args),flush=True)
 if __name__=="__main__":
-    host=os.environ.get("CLIENT_CONFIG_HOST","127.0.0.1"); port=int(os.environ.get("CLIENT_CONFIG_PORT","8080")); print(f"Client Config MVP listening on http://{host}:{port}"); ThreadingHTTPServer((host,port),Handler).serve_forever()
+    host=os.environ.get("CLIENT_CONFIG_HOST","127.0.0.1"); port=int(os.environ.get("CLIENT_CONFIG_PORT","8080")); server=ThreadingHTTPServer((host,port),Handler); print(f"Client Config MVP listening on http://{host}:{port}")
+    try: server.serve_forever()
+    except KeyboardInterrupt: print("Client Config MVP stopped")
+    finally: server.server_close()

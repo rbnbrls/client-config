@@ -1,5 +1,5 @@
 # Lokale projectplanning: niet publiceren naar GitHub
-/docs/PROJECT-PLAN.md
+#/docs/PROJECT-PLAN.md
 
 # Lokale SQLite-database en tijdelijke journal-/WAL-bestanden
 /data/*.db
