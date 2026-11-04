@@ -148,6 +148,31 @@ def init():
           CREATE INDEX IF NOT EXISTS activity_register_customer ON activity_register(customer_id,id,version);
           CREATE TRIGGER IF NOT EXISTS activity_register_no_update BEFORE UPDATE ON activity_register BEGIN SELECT RAISE(ABORT,'activity register entries are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS activity_register_no_delete BEFORE DELETE ON activity_register BEGIN SELECT RAISE(ABORT,'activity register entries are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS chain_parties(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          party_type TEXT NOT NULL, name TEXT NOT NULL, service TEXT NOT NULL,
+          data_flow TEXT NOT NULL, jurisdiction TEXT NOT NULL, legal_entity TEXT NOT NULL,
+          contract_ref TEXT NOT NULL, parent_party_id TEXT,
+          criticality TEXT NOT NULL, subcontract_share REAL,
+          source_ref TEXT NOT NULL, effective_from TEXT NOT NULL, effective_to TEXT,
+          rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS chain_parties_customer ON chain_parties(customer_id,id,version);
+          CREATE TRIGGER IF NOT EXISTS chain_parties_no_update BEFORE UPDATE ON chain_parties BEGIN SELECT RAISE(ABORT,'chain parties are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS chain_parties_no_delete BEFORE DELETE ON chain_parties BEGIN SELECT RAISE(ABORT,'chain parties are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS chain_tasks(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          party_id TEXT NOT NULL, task_type TEXT NOT NULL,
+          owner TEXT NOT NULL, deadline TEXT NOT NULL,
+          status TEXT NOT NULL, completion_evidence TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS chain_tasks_customer ON chain_tasks(customer_id,party_id,version);
+          CREATE TRIGGER IF NOT EXISTS chain_tasks_no_update BEFORE UPDATE ON chain_tasks BEGIN SELECT RAISE(ABORT,'chain tasks are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS chain_tasks_no_delete BEFORE DELETE ON chain_tasks BEGIN SELECT RAISE(ABORT,'chain tasks are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -954,3 +979,174 @@ def activity_chain(customer_id,activity_id,valid_at=None,known_at=None):
             "fund_mandate_ref":activity["fund_mandate_ref"],"missing_contract_fields":missing,
             "dependencies":dependencies,"review_status":review_status,
             "validation_note":"te valideren door Compliance/Legal voor relevante klant/partij"}
+
+# OUT-002: Ketenregister — directe en indirecte aanbieders, diensten, datastromen,
+# geografische/juridische entiteiten, contractrelaties en onderuitbesteders.
+# Wijziging van een schakel identificeert geraakte klanten/mandaten.
+CHAIN_PARTY_TYPES={"direct","indirect","subcontractor"}
+# Thresholds zijn bronverwijzingen/policyparameters, nooit universeel hardcoded:
+# de DNB-verwachting rond 30% onderuitbesteding staat hier als geparametriseerde
+# bronvermelding die per klant/party kan worden overschreven.
+CHAIN_THRESHOLD_DEFAULTS={"subcontract_share_pct":None,
+    "source_ref":"DNB-verwachting 30% onderuitbesteding (bronvermelding); klantspecifiek te bevestigen door Compliance/Legal"}
+
+def _chain_rows(customer_id,valid_at,known_at):
+    valid_at=valid_at or datetime.now(timezone.utc).date().isoformat()
+    known_stamp=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("SELECT * FROM chain_parties WHERE customer_id=? AND created_at<=? ORDER BY id,version",(customer_id,known_stamp)).fetchall()
+    valid={}
+    for row in rows:
+        item=dict(row)
+        if item["effective_from"]>valid_at: continue
+        if item["effective_to"] and item["effective_to"]<=valid_at: continue
+        prior=valid.get(item["id"])
+        if not prior or item["version"]>prior["version"]: valid[item["id"]]=item
+    return list(valid.values())
+
+def chain_parties(customer_id=None,valid_at=None,known_at=None):
+    if customer_id is not None:
+        return _chain_rows(customer_id,valid_at,known_at)
+    with connect() as db:
+        rows=db.execute("SELECT c.* FROM chain_parties c JOIN (SELECT id,customer_id,MAX(version) version FROM chain_parties GROUP BY id,customer_id) latest ON c.id=latest.id AND c.customer_id=latest.customer_id AND c.version=latest.version ORDER BY c.created_at DESC").fetchall()
+    return [dict(r) for r in rows]
+
+def _chain_ancestors(party,by_id,depth=0):
+    chain=[]; seen={party["id"]}; cur=party
+    while cur.get("parent_party_id"):
+        parent=by_id.get(cur["parent_party_id"])
+        if parent is None or parent["id"] in seen: break
+        seen.add(parent["id"]); chain.append({**parent,"depth":depth+1})
+        cur=parent; depth+=1
+    return chain
+
+def _chain_descendants(party,by_id,depth=0):
+    chain=[]; frontier=[party]; seen={party["id"]}
+    while frontier:
+        nxt=[]
+        for node in frontier:
+            for other in by_id.values():
+                if other["id"] not in seen and other.get("parent_party_id")==node["id"]:
+                    seen.add(other["id"]); nxt.append(other)
+                    chain.append({**other,"depth":depth+1})
+        frontier=nxt; depth+=1
+    return chain
+
+def chain_trace(customer_id,party_id,valid_at=None,known_at=None):
+    rows=_chain_rows(customer_id,valid_at,known_at)
+    by_id={r["id"]:r for r in rows}
+    if party_id not in by_id: raise ValueError("Ketenpartij niet gevonden voor deze klant")
+    party=by_id[party_id]
+    return {"customer_id":customer_id,"party":party,
+            "upstream":_chain_ancestors(party,by_id)+[party],
+            "downstream":_chain_descendants(party,by_id)}
+
+def chain_impact(customer_id,party_id,valid_at=None,known_at=None,thresholds=None):
+    """Ketenimpact van een schakelwijziging: upstream+downstream keten, geraakte
+    mandaten via dienstkoppeling op het activiteitenregister, thresholdovertredingen
+    en open meldingstaken. Thresholds zijn parameters met bronverwijzing."""
+    trace=chain_trace(customer_id,party_id,valid_at=valid_at,known_at=known_at)
+    parties=[p for p in ([trace["party"]]+trace["downstream"])]
+    threshold=dict(CHAIN_THRESHOLD_DEFAULTS)
+    if thresholds:
+        if not isinstance(thresholds,dict): raise ValueError("thresholds moet een object met source_ref zijn")
+        if not thresholds.get("source_ref"): raise ValueError("thresholds vereisen een source_ref (policyparameter)")
+        threshold.update(thresholds)
+    breaches=[]
+    if threshold.get("subcontract_share_pct") is not None:
+        pct=float(threshold["subcontract_share_pct"])
+        for p in parties:
+            # partijfracties zijn 0-1; threshold is percentage — normaliseer naar %.
+            if p.get("subcontract_share") is not None and float(p["subcontract_share"])*100>pct:
+                breaches.append({"id":p["id"],"party_id":p["id"],"subcontract_share":p["subcontract_share"],"share_pct":round(float(p["subcontract_share"])*100,4),"threshold_pct":threshold["subcontract_share_pct"]})
+    acts=activities(customer_id=customer_id,valid_at=valid_at,known_at=known_at)
+    services={str(p["service"]).upper() for p in parties}
+    affected=[a for a in acts if services & {str(s).upper() for s in (a.get("services") or [])}]
+    with connect() as db:
+        task_rows=db.execute("SELECT c.* FROM chain_tasks c JOIN (SELECT id,MAX(version) version FROM chain_tasks WHERE customer_id=? GROUP BY id) latest ON c.id=latest.id AND c.version=latest.version WHERE c.customer_id=? AND c.party_id=?",(customer_id,customer_id,party_id)).fetchall()
+    open_tasks=[dict(t) for t in task_rows if t["status"]!="completed"]
+    return {"customer_id":customer_id,"changed_party":trace["party"],
+            "changed_party_and_downstream":[{"id":p["id"],"party_type":p["party_type"],"name":p["name"],"service":p["service"],"parent_party_id":p.get("parent_party_id")} for p in parties],
+            "affected_mandates":[{"activity_id":a["id"],"activity_code":a["activity_code"],"fund_mandate_ref":a.get("fund_mandate_ref") or "",} for a in affected],
+            "threshold_parameters":threshold,"threshold_breaches":breaches,
+            "open_notification_tasks":open_tasks,
+            "review_status":"pending",
+            "validation_note":"te valideren door Compliance/Legal voor relevante klant/partij"}
+
+def save_chain_party(data):
+    required=(("customer_id"),"party_type","name","service","data_flow","jurisdiction","legal_entity","contract_ref","criticality","source_ref","rationale","effective_from")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["party_type"] not in CHAIN_PARTY_TYPES: raise ValueError("party_type moet direct, indirect of subcontractor zijn")
+    if data["criticality"] not in ACTIVITY_CRITICALITY: raise ValueError("Kritikaliteit moet laag, gemiddeld of hoog zijn")
+    share=data.get("subcontract_share")
+    if share is not None:
+        try: share=float(share)
+        except (TypeError,ValueError): raise ValueError("subcontract_share moet een numerieke fractie zijn")
+        if not 0<=share<=1: raise ValueError("subcontract_share moet tussen 0 en 1 liggen")
+    pid=data.get("id") or "cty-"+re.sub(r"[^a-z0-9]+","-",str(data["name"]).lower()).strip("-")
+    try:
+        date.fromisoformat(str(data["effective_from"]))
+    except ValueError: raise ValueError("Geldigheidsdatums moeten ISO-formaat YYYY-MM-DD hebben")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM chain_parties WHERE id=? AND customer_id=?",(pid,data["customer_id"])).fetchone()["version"]
+        parent=data.get("parent_party_id")
+        if parent:
+            prow=db.execute("SELECT * FROM chain_parties WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(parent,data["customer_id"])).fetchone()
+            if prow is None: raise ValueError("Parentketenpartij niet gevonden voor deze klant")
+            ancestors={prow["id"]}; cur=prow
+            while cur["parent_party_id"]:
+                nxt=db.execute("SELECT * FROM chain_parties WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(cur["parent_party_id"],data["customer_id"])).fetchone()
+                if nxt is None or nxt["id"] in ancestors: break
+                ancestors.add(nxt["id"]); cur=nxt
+            if pid in ancestors: raise ValueError("Parentrelatie mag geen cyclus vormen")
+        version=(previous or 0)+1
+        stamp=now(); actor=data.get("actor","demo.client-service").strip()
+        db.execute("INSERT INTO chain_parties VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(pid,version,data["customer_id"],data["party_type"],str(data["name"]).strip(),str(data["service"]).strip(),str(data["data_flow"]).strip(),str(data["jurisdiction"]).strip(),str(data["legal_entity"]).strip(),str(data["contract_ref"]).strip(),parent,data["criticality"],share,str(data["source_ref"]).strip(),str(data["effective_from"]).strip(),data.get("effective_to") or None,data["rationale"].strip(),actor,stamp))
+        audit(db,"chain_parties",pid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"party_type":data["party_type"],"service":data["service"],"parent_party_id":parent,"criticality":data["criticality"],"subcontract_share":share,"source_ref":data["source_ref"]})
+    with connect() as db: saved=db.execute("SELECT * FROM chain_parties WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,data["customer_id"])).fetchone()
+    return dict(saved)
+
+def chain_tasks(customer_id,party_id=None,known_at=None):
+    known_stamp=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("SELECT * FROM chain_tasks WHERE customer_id=? AND created_at<=?",(customer_id,known_stamp)).fetchall()
+    grouped={}
+    for row in rows:
+        item=dict(row)
+        prior=grouped.get(item["id"])
+        if not prior or item["version"]>prior["version"]: grouped[item["id"]]=item
+    return [t for t in grouped.values() if party_id is None or t["party_id"]==party_id]
+
+def save_chain_task(data):
+    required=(("customer_id"),"party_id","task_type","owner","deadline","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",str(data["deadline"])): raise ValueError("deadline moet ISO-formaat YYYY-MM-DD hebben")
+    try: date.fromisoformat(str(data["deadline"]))
+    except ValueError: raise ValueError("deadline moet ISO-formaat YYYY-MM-DD hebben")
+    with connect() as db:
+        prow=db.execute("SELECT 1 FROM chain_parties WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(data["party_id"],data["customer_id"])).fetchone()
+        if prow is None: raise ValueError("Ketenpartij niet gevonden voor deze klant")
+        tid=data.get("id") or "ctk-"+re.sub(r"[^a-z0-9]+","-",f"{data['customer_id']}-{data['party_id']}-{data['task_type']}".lower()).strip("-")
+        status="completed" if data.get("status")=="completed" else "open"
+        if status=="completed" and not data.get("completion_evidence"): raise ValueError("Afronding vereist bewijs (completion_evidence)")
+        previous=db.execute("SELECT MAX(version) version FROM chain_tasks WHERE id=? AND customer_id=?",(tid,data["customer_id"])).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now(); actor=data.get("actor","demo.compliance").strip()
+        db.execute("INSERT INTO chain_tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(tid,version,data["customer_id"],data["party_id"],str(data["task_type"]).strip(),str(data["owner"]).strip(),str(data["deadline"]).strip(),status,data.get("completion_evidence"),str(data.get("source_ref") or "SYNTHETIC-AUDIT-001"),data["rationale"].strip(),actor,stamp))
+        audit(db,"chain_tasks",tid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"party_id":data["party_id"],"task_type":data["task_type"],"owner":data["owner"],"deadline":data["deadline"],"status":status,"completion_evidence":data.get("completion_evidence")})
+    with connect() as db: saved=db.execute("SELECT * FROM chain_tasks WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(tid,data["customer_id"])).fetchone()
+    return dict(saved)
+
+def complete_chain_task(task_id,customer_id,evidence,actor=None):
+    if not evidence or not str(evidence).strip(): raise ValueError("Afronding vereist bewijs: evidence is verplicht")
+    with connect() as db:
+        rows=db.execute("SELECT * FROM chain_tasks WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(task_id,customer_id)).fetchone()
+        if rows is None: raise ValueError("Meldingtaak niet gevonden")
+        task=dict(rows)
+        if task["status"]=="completed": raise ValueError("Meldingtaak is al afgerond; append-only, registreer een nieuwe taak of herziening")
+    new=dict(task); new.update({"status":"completed","completion_evidence":str(evidence).strip(),"rationale":f"Afronding: {task['rationale']}","actor":actor or task["created_by"]})
+    return save_chain_task({k:v for k,v in new.items() if k!="version"})
