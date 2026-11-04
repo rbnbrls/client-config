@@ -331,6 +331,16 @@ def init():
           CREATE INDEX IF NOT EXISTS sfdr_pai_profiles_customer ON sfdr_pai_profiles(customer_id,profile_name,version);
           CREATE TRIGGER IF NOT EXISTS sfdr_pai_profiles_no_update BEFORE UPDATE ON sfdr_pai_profiles BEGIN SELECT RAISE(ABORT,'sfdr pai profiles are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS sfdr_pai_profiles_no_delete BEFORE DELETE ON sfdr_pai_profiles BEGIN SELECT RAISE(ABORT,'sfdr pai profiles are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS comply_or_explain(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          code_ref TEXT NOT NULL, compliance_status TEXT NOT NULL, deviation_explanation TEXT NOT NULL,
+          validity_from TEXT NOT NULL, validity_to TEXT NOT NULL, impact TEXT NOT NULL,
+          approver TEXT NOT NULL, follow_up_action TEXT NOT NULL,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS comply_or_explain_customer ON comply_or_explain(customer_id,code_ref,version);
+          CREATE TRIGGER IF NOT EXISTS comply_or_explain_no_update BEFORE UPDATE ON comply_or_explain BEGIN SELECT RAISE(ABORT,'comply or explain records are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS comply_or_explain_no_delete BEFORE DELETE ON comply_or_explain BEGIN SELECT RAISE(ABORT,'comply or explain records are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -1284,6 +1294,37 @@ def save_sfdr_pai_profile(data):
         audit(db,"sfdr_pai_profiles",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"profile_name":data["profile_name"],"reporting_frequency":data["reporting_frequency"]})
     with connect() as db: saved=db.execute("SELECT * FROM sfdr_pai_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+COMPLY_OR_EXPLAIN_STATUSES=("comply","explain","deviation")
+
+def comply_or_explain(customer_id=None, code_ref=None, compliance_status=None):
+    with connect() as db:
+        q="SELECT * FROM comply_or_explain WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if code_ref: q+=" AND code_ref=?"; params.append(code_ref)
+        if compliance_status: q+=" AND compliance_status=?"; params.append(compliance_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_comply_or_explain(data):
+    required=("customer_id","code_ref","compliance_status","deviation_explanation","validity_from","validity_to","impact","approver","follow_up_action","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["compliance_status"] not in COMPLY_OR_EXPLAIN_STATUSES: raise ValueError(f"compliance_status moet een van {', '.join(COMPLY_OR_EXPLAIN_STATUSES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["code_ref"]))))
+    cid=data["customer_id"]; ceid=data.get("id") or f"comply-explain-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM comply_or_explain WHERE id=? AND customer_id=?",(ceid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO comply_or_explain(id,version,customer_id,code_ref,compliance_status,deviation_explanation,validity_from,validity_to,impact,approver,follow_up_action,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (ceid,version,cid,data["code_ref"].strip(),data["compliance_status"].strip(),data["deviation_explanation"].strip(),data["validity_from"].strip(),data["validity_to"].strip(),data["impact"].strip(),data["approver"].strip(),data["follow_up_action"].strip(),data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"comply_or_explain",ceid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"code_ref":data["code_ref"],"compliance_status":data["compliance_status"]})
+    with connect() as db: saved=db.execute("SELECT * FROM comply_or_explain WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(ceid,cid)).fetchone()
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
