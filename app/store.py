@@ -111,6 +111,17 @@ def init():
           CREATE INDEX IF NOT EXISTS ict_provider_relation_latest ON ict_provider_relations(id,version);
           CREATE TRIGGER IF NOT EXISTS ict_provider_relation_no_update BEFORE UPDATE ON ict_provider_relations BEGIN SELECT RAISE(ABORT,'ICT provider relations are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS ict_provider_relation_no_delete BEFORE DELETE ON ict_provider_relations BEGIN SELECT RAISE(ABORT,'ICT provider relations are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS governance_policies(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT REFERENCES customers(id),
+          policy TEXT NOT NULL, monitoring_frequency TEXT NOT NULL, reporting TEXT NOT NULL,
+          escalation TEXT NOT NULL, independent_evaluation TEXT NOT NULL, capacity TEXT NOT NULL,
+          evaluation_date TEXT NOT NULL, applicability TEXT NOT NULL, source_ref TEXT NOT NULL,
+          reviewer TEXT NOT NULL, reviewer_role TEXT NOT NULL, rationale TEXT NOT NULL,
+          review_date TEXT NOT NULL, created_at TEXT NOT NULL, effective_from TEXT, effective_to TEXT,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS governance_policy_latest ON governance_policies(id,version);
+          CREATE TRIGGER IF NOT EXISTS governance_policy_no_update BEFORE UPDATE ON governance_policies BEGIN SELECT RAISE(ABORT,'Governance policies are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS governance_policy_no_delete BEFORE DELETE ON governance_policies BEGIN SELECT RAISE(ABORT,'Governance policies are append-only'); END;''')
         db.executescript('''CREATE TABLE IF NOT EXISTS client_entities(
           id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
           entity_type TEXT NOT NULL, name TEXT NOT NULL, legal_identifier TEXT NOT NULL,
@@ -602,6 +613,51 @@ def save_ict_provider_relation(data):
         db.execute("INSERT INTO ict_provider_relations(id,version,customer_id,provider,ict_service,function_classification,contract_ref,incident_evidence,exit_evidence,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,customer_id,data["provider"].strip(),data["ict_service"].strip(),data["function_classification"],data["contract_ref"].strip(),data["incident_evidence"].strip(),data["exit_evidence"].strip(),data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
         audit(db,"ict_provider_relation",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"function_classification":data["function_classification"],"customer_id":customer_id,"applicability":data["applicability"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
     return next(r for r in ict_provider_relations() if r["id"]==rid)
+
+def governance_policies(valid_at=None, known_at=None, customer_id=None):
+    known_at=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("""SELECT g.* FROM governance_policies g JOIN
+          (SELECT id,MAX(version) version FROM governance_policies WHERE created_at<=? GROUP BY id) latest
+          ON g.id=latest.id AND g.version=latest.version
+          WHERE (? IS NULL OR g.customer_id=? OR g.customer_id IS NULL) ORDER BY g.created_at DESC""",(known_at,customer_id,customer_id)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        if not item["effective_from"]: item["validity_status"]="unset_legacy"
+        elif valid_at and item["effective_from"]<=valid_at and (not item["effective_to"] or item["effective_to"]>valid_at): item["validity_status"]="valid"
+        elif valid_at: continue
+        else: item["validity_status"]="dated"
+        result.append(item)
+    return result
+
+def save_governance_policy(data):
+    required=("policy","monitoring_frequency","reporting","escalation","independent_evaluation","capacity","evaluation_date","applicability","source_ref","reviewer","reviewer_role","rationale","review_date","effective_from")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    applicability={"pending_review","in_scope","out_of_scope"}
+    if data["applicability"] not in applicability:raise ValueError("Ongeldige toepasselijkheidsstatus")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["effective_from"]):raise ValueError
+        date.fromisoformat(data["effective_from"])
+        effective_to=(data.get("effective_to") or "").strip() or None
+        if effective_to and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}",effective_to) or date.fromisoformat(effective_to)<=date.fromisoformat(data["effective_from"])):raise ValueError
+    except ValueError:raise ValueError("Geldigheidsperiode moet ISO YYYY-MM-DD zijn; einddatum moet na startdatum liggen")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["review_date"]):raise ValueError("Geldigheids- en reviewdatum moeten ISO-formaat YYYY-MM-DD hebben")
+    date.fromisoformat(data["review_date"])
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["evaluation_date"]):raise ValueError("Evaluatiedatum moet ISO-formaat YYYY-MM-DD hebben")
+    date.fromisoformat(data["evaluation_date"])
+    customer_id=(data.get("customer_id") or "").strip() or None
+    if customer_id and not customer(customer_id):raise ValueError("Klant niet gevonden")
+    role=data["reviewer_role"]
+    if role not in {"compliance","legal","risk","ict_risk"}:raise ValueError("Reviewerrol moet Compliance, Legal, Risk of ICT-risk zijn")
+    rid=data.get("id") or str(uuid.uuid4()); actor=data.get("actor",data["reviewer"]).strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM governance_policies WHERE id=?",(rid,)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO governance_policies(id,version,customer_id,policy,monitoring_frequency,reporting,escalation,independent_evaluation,capacity,evaluation_date,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,customer_id,data["policy"].strip(),data["monitoring_frequency"].strip(),data["reporting"].strip(),data["escalation"].strip(),data["independent_evaluation"].strip(),data["capacity"].strip(),data["evaluation_date"],data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
+        audit(db,"governance_policy",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"customer_id":customer_id,"applicability":data["applicability"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
+    return next(r for r in governance_policies() if r["id"]==rid)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
