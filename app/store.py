@@ -341,6 +341,18 @@ def init():
           CREATE INDEX IF NOT EXISTS comply_or_explain_customer ON comply_or_explain(customer_id,code_ref,version);
           CREATE TRIGGER IF NOT EXISTS comply_or_explain_no_update BEFORE UPDATE ON comply_or_explain BEGIN SELECT RAISE(ABORT,'comply or explain records are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS comply_or_explain_no_delete BEFORE DELETE ON comply_or_explain BEGIN SELECT RAISE(ABORT,'comply or explain records are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS reporting_executions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          report_ref TEXT NOT NULL, calendar_period TEXT NOT NULL, deadline TEXT NOT NULL,
+          delivery_status TEXT NOT NULL, completeness TEXT NOT NULL, data_quality_errors TEXT,
+          delay_days INTEGER NOT NULL DEFAULT 0, incident_ref TEXT, recovery_action TEXT,
+          escalation TEXT NOT NULL DEFAULT 'none', approved_report_ref TEXT, schema_version TEXT,
+          methodology_version TEXT, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS reporting_executions_customer ON reporting_executions(customer_id,report_ref,version);
+          CREATE TRIGGER IF NOT EXISTS reporting_executions_no_update BEFORE UPDATE ON reporting_executions BEGIN SELECT RAISE(ABORT,'reporting executions are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS reporting_executions_no_delete BEFORE DELETE ON reporting_executions BEGIN SELECT RAISE(ABORT,'reporting executions are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -790,6 +802,8 @@ REPORTING_TYPES=("regulatory","client","internal","pai_sfdr","wtp","dora")
 REPORTING_FREQUENCIES=("monthly","quarterly","semiannual","annual","ad_hoc","event_driven")
 REPORTING_LANGUAGES=("nl","en","de","fr")
 SUPPLIER_ROLES=("fund","fiduciary","manager","submanager","third_party")
+REPORTING_EXECUTION_STATUSES=("planned","on_track","delivered","delayed","incomplete","failed","recovered","approved")
+REPORTING_ESCALATION_LEVELS=("none","client","compliance","management")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1325,6 +1339,40 @@ def save_comply_or_explain(data):
         audit(db,"comply_or_explain",ceid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"code_ref":data["code_ref"],"compliance_status":data["compliance_status"]})
     with connect() as db: saved=db.execute("SELECT * FROM comply_or_explain WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(ceid,cid)).fetchone()
+    return dict(saved)
+
+def reporting_executions(customer_id=None, report_ref=None, delivery_status=None):
+    with connect() as db:
+        q="SELECT * FROM reporting_executions WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if report_ref: q+=" AND report_ref=?"; params.append(report_ref)
+        if delivery_status: q+=" AND delivery_status=?"; params.append(delivery_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_reporting_execution(data):
+    required=("customer_id","report_ref","calendar_period","deadline","delivery_status","completeness","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["delivery_status"] not in REPORTING_EXECUTION_STATUSES: raise ValueError(f"delivery_status moet een van {', '.join(REPORTING_EXECUTION_STATUSES)} zijn")
+    escalation=(data.get("escalation") or "none").strip()
+    if escalation not in REPORTING_ESCALATION_LEVELS: raise ValueError(f"escalation moet een van {', '.join(REPORTING_ESCALATION_LEVELS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["report_ref"]),str(data["calendar_period"]))))
+    eid=data.get("id") or f"rpt-exec-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    delay=int(data.get("delay_days") or 0)
+    errors=data.get("data_quality_errors")
+    if isinstance(errors,(list,tuple)): errors=json.dumps(errors)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM reporting_executions WHERE id=? AND customer_id=?",(eid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO reporting_executions(id,version,customer_id,report_ref,calendar_period,deadline,delivery_status,completeness,data_quality_errors,delay_days,incident_ref,recovery_action,escalation,approved_report_ref,schema_version,methodology_version,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (eid,version,cid,data["report_ref"].strip(),data["calendar_period"].strip(),data["deadline"].strip(),data["delivery_status"].strip(),data["completeness"].strip(),errors,delay,(data.get("incident_ref") or "").strip() or None,(data.get("recovery_action") or "").strip() or None,escalation,(data.get("approved_report_ref") or "").strip() or None,(data.get("schema_version") or "").strip() or None,(data.get("methodology_version") or "").strip() or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"reporting_executions",eid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"report_ref":data["report_ref"],"delivery_status":data["delivery_status"]})
+    with connect() as db: saved=db.execute("SELECT * FROM reporting_executions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(eid,cid)).fetchone()
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
