@@ -426,6 +426,23 @@ def init():
             CREATE INDEX IF NOT EXISTS wtp_risks_customer ON wtp_risks(customer_id,fund_ref,risk_category,version);
             CREATE TRIGGER IF NOT EXISTS wtp_risks_no_update BEFORE UPDATE ON wtp_risks BEGIN SELECT RAISE(ABORT,'wtp risks are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS wtp_risks_no_delete BEFORE DELETE ON wtp_risks BEGIN SELECT RAISE(ABORT,'wtp risks are append-only'); END;''')
+        # FEE-001 Fee-componenten
+        db.executescript('''CREATE TABLE IF NOT EXISTS fee_components(
+            id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, fee_type TEXT NOT NULL, fee_name TEXT NOT NULL,
+            rate_bps REAL, tier_from REAL, tier_to REAL, minimum_amount REAL, minimum_currency TEXT,
+            fixed_amount REAL, fixed_currency TEXT, fixed_frequency TEXT,
+            performance_fee_pct REAL, hurdle_rate_pct REAL, high_water_mark INTEGER,
+            discount_pct REAL, side_letter_ref TEXT, currency TEXT NOT NULL,
+            accrual_frequency TEXT NOT NULL, invoice_frequency TEXT NOT NULL,
+            indexation_basis TEXT, indexation_frequency TEXT,
+            effective_from TEXT, effective_to TEXT,
+            source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));
+            CREATE INDEX IF NOT EXISTS fee_components_customer ON fee_components(customer_id,fund_ref,fee_type,version);
+            CREATE TRIGGER IF NOT EXISTS fee_components_no_update BEFORE UPDATE ON fee_components BEGIN SELECT RAISE(ABORT,'fee components are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS fee_components_no_delete BEFORE DELETE ON fee_components BEGIN SELECT RAISE(ABORT,'fee components are append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -1676,6 +1693,67 @@ def save_wtp_risk(data):
             {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"risk_category":data["risk_category"]})
     with connect() as db: saved=db.execute("SELECT * FROM wtp_risks WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
     return dict(saved)
+
+FEE_COMPONENT_TYPES=("aum","fixed","performance","minimum","discount","side_letter","indexation")
+FEE_FREQUENCIES=("monthly","quarterly","semiannual","annual","on_demand")
+FEE_CURRENCIES=("EUR","USD","GBP","CHF")
+
+def fee_components(customer_id=None, fund_ref=None, fee_type=None, currency=None):
+    with connect() as db:
+        q="SELECT * FROM fee_components WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if fee_type: q+=" AND fee_type=?"; params.append(fee_type)
+        if currency: q+=" AND currency=?"; params.append(currency)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_fee_component(data):
+    required=("customer_id","fund_ref","fee_type","fee_name","currency","accrual_frequency","invoice_frequency","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["fee_type"] not in FEE_COMPONENT_TYPES:
+        raise ValueError(f"fee_type moet een van {', '.join(FEE_COMPONENT_TYPES)} zijn")
+    if data["currency"] not in FEE_CURRENCIES:
+        raise ValueError(f"currency moet een van {', '.join(FEE_CURRENCIES)} zijn")
+    if data["accrual_frequency"] not in FEE_FREQUENCIES:
+        raise ValueError(f"accrual_frequency moet een van {', '.join(FEE_FREQUENCIES)} zijn")
+    if data["invoice_frequency"] not in FEE_FREQUENCIES:
+        raise ValueError(f"invoice_frequency moet een van {', '.join(FEE_FREQUENCIES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["fee_type"]),str(data["fee_name"]))))
+    pid=data.get("id") or f"fee-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k); return (str(v).strip() if v is not None else None) or None
+    def optf(k):
+        v=data.get(k)
+        if v is None or v=="": return None
+        return float(v)
+    hwm=data.get("high_water_mark")
+    hwm_v=1 if hwm in (True,1,"1","true","True","yes") else (0 if hwm in (False,0,"0","false","False","no") else None)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM fee_components WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO fee_components(id,version,customer_id,fund_ref,fee_type,fee_name,rate_bps,tier_from,tier_to,minimum_amount,minimum_currency,fixed_amount,fixed_currency,fixed_frequency,performance_fee_pct,hurdle_rate_pct,high_water_mark,discount_pct,side_letter_ref,currency,accrual_frequency,invoice_frequency,indexation_basis,indexation_frequency,effective_from,effective_to,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),data["fee_type"].strip(),data["fee_name"].strip(),
+           optf("rate_bps"),optf("tier_from"),optf("tier_to"),optf("minimum_amount"),opt("minimum_currency"),
+           optf("fixed_amount"),opt("fixed_currency"),opt("fixed_frequency"),optf("performance_fee_pct"),
+           optf("hurdle_rate_pct"),hwm_v,optf("discount_pct"),opt("side_letter_ref"),data["currency"].strip(),
+           data["accrual_frequency"].strip(),data["invoice_frequency"].strip(),opt("indexation_basis"),
+           opt("indexation_frequency"),opt("effective_from"),opt("effective_to"),data["source_ref"].strip(),
+           data["rationale"].strip(),actor,stamp))
+        audit(db,"fee_components",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"fee_type":data["fee_type"]})
+    with connect() as db: saved=db.execute("SELECT * FROM fee_components WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def fee_components_export(customer_id=None, fund_ref=None):
+    rows=fee_components(customer_id=customer_id,fund_ref=fund_ref)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},
+            "coverage":len(rows),"rows":rows}
 
 # Aliases for naming variants
 wtp_risk_controls = wtp_risks
