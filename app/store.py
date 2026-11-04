@@ -187,6 +187,19 @@ def init():
           CREATE INDEX IF NOT EXISTS contract_minimums_customer ON contract_minimums(customer_id,contract_ref,version);
           CREATE TRIGGER IF NOT EXISTS contract_minimums_no_update BEFORE UPDATE ON contract_minimums BEGIN SELECT RAISE(ABORT,'contract minimums are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS contract_minimums_no_delete BEFORE DELETE ON contract_minimums BEGIN SELECT RAISE(ABORT,'contract minimums are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS selection_assessments(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          fund_ref TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT,
+          license_certification TEXT, financial_solidity TEXT, continuity TEXT,
+          risk_management TEXT, integrity TEXT,
+          evidence_ref TEXT, review_cycle TEXT, next_review_at TEXT, status TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS selection_assessments_customer ON selection_assessments(customer_id,fund_ref,version);
+          CREATE TRIGGER IF NOT EXISTS selection_assessments_no_update BEFORE UPDATE ON selection_assessments BEGIN SELECT RAISE(ABORT,'selection assessments are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS selection_assessments_no_delete BEFORE DELETE ON selection_assessments BEGIN SELECT RAISE(ABORT,'selection assessments are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -1210,4 +1223,50 @@ def save_contract_minimum(data):
             {"customer_id":cid,"version":version,"contract_ref":data["contract_ref"],"subject_type":data["subject_type"],
              "missing":missing_contract_fields(data)})
     with connect() as db: saved=db.execute("SELECT * FROM contract_minimums WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(mid,cid)).fetchone()
+    return dict(saved)
+
+SELECTION_CRITERIA_FIELDS = ("license_certification","financial_solidity","continuity","risk_management","integrity")
+
+def missing_selection_criteria(data):
+    return [f for f in SELECTION_CRITERIA_FIELDS if not data.get(f)]
+
+def selection_assessments(customer_id=None, fund_ref=None, known_at=None):
+    known_stamp=_utc_stamp(known_at or now())
+    with connect() as db:
+        q="SELECT * FROM selection_assessments WHERE created_at<=?"
+        params=[known_stamp]
+        if customer_id:
+            q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref:
+            q+=" AND fund_ref=?"; params.append(fund_ref)
+        rows=db.execute(q,params).fetchall()
+    grouped={}
+    for row in rows:
+        item=dict(row)
+        prior=grouped.get(item["id"])
+        if not prior or item["version"]>prior["version"]: grouped[item["id"]]=item
+    return list(grouped.values())
+
+def save_selection_assessment(data):
+    required=("customer_id","fund_ref","subject_type","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["subject_type"] not in ("fund","mandate","party"): raise ValueError("subject_type moet fund, mandate of party zijn")
+    cid=data["customer_id"]
+    mid=data.get("id") or "sa-"+re.sub(r"[^a-z0-9]+","-",str(data["fund_ref"]).lower()).strip("-")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM selection_assessments WHERE id=? AND customer_id=?",(mid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now(); actor=data.get("actor","demo.client-service").strip()
+        db.execute("INSERT INTO selection_assessments VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (mid,version,cid,str(data["fund_ref"]).strip(),str(data["subject_type"]).strip(),data.get("subject_id"),
+             data.get("license_certification"),data.get("financial_solidity"),data.get("continuity"),
+             data.get("risk_management"),data.get("integrity"),
+             data.get("evidence_ref"),data.get("review_cycle"),data.get("next_review_at"),data.get("status"),
+             str(data["source_ref"]).strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"selection_assessments",mid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"subject_type":data["subject_type"],
+             "missing":missing_selection_criteria(data)})
+    with connect() as db: saved=db.execute("SELECT * FROM selection_assessments WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(mid,cid)).fetchone()
     return dict(saved)
