@@ -414,6 +414,18 @@ def init():
             CREATE INDEX IF NOT EXISTS wtp_milestones_customer ON wtp_milestones(customer_id,fund_ref,deliverable,version);
             CREATE TRIGGER IF NOT EXISTS wtp_milestones_no_update BEFORE UPDATE ON wtp_milestones BEGIN SELECT RAISE(ABORT,'wtp milestones are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS wtp_milestones_no_delete BEFORE DELETE ON wtp_milestones BEGIN SELECT RAISE(ABORT,'wtp milestones are append-only'); END;''')
+        # WTP-005 Risico's en wijzigingsbeheer
+        db.executescript('''CREATE TABLE IF NOT EXISTS wtp_risks(
+            id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, risk_category TEXT NOT NULL, risk_description TEXT NOT NULL,
+            mitigation TEXT NOT NULL, change_impact TEXT NOT NULL, affected_roles TEXT,
+            required_data TEXT, missing_interfaces TEXT, critical_milestone TEXT,
+            evidence_status TEXT, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));
+            CREATE INDEX IF NOT EXISTS wtp_risks_customer ON wtp_risks(customer_id,fund_ref,risk_category,version);
+            CREATE TRIGGER IF NOT EXISTS wtp_risks_no_update BEFORE UPDATE ON wtp_risks BEGIN SELECT RAISE(ABORT,'wtp risks are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS wtp_risks_no_delete BEFORE DELETE ON wtp_risks BEGIN SELECT RAISE(ABORT,'wtp risks are append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -1622,6 +1634,56 @@ def save_wtp_milestone(data):
             {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"deliverable":data["deliverable"]})
     with connect() as db: saved=db.execute("SELECT * FROM wtp_milestones WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
     return dict(saved)
+
+# WTP-005 Risico's en wijzigingsbeheer: geldige risicocategorieen en bewijsstatussen.
+WTP_RISK_CATEGORIES=("operational","data","IT","financial","chain")
+WTP_RISK_EVIDENCE_STATUSES=("open","mitigated","accepted","closed")
+
+def wtp_risks(customer_id=None, fund_ref=None, risk_category=None, evidence_status=None):
+    with connect() as db:
+        q="SELECT * FROM wtp_risks WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if risk_category: q+=" AND risk_category=?"; params.append(risk_category)
+        if evidence_status: q+=" AND evidence_status=?"; params.append(evidence_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_wtp_risk(data):
+    required=("customer_id","fund_ref","risk_category","risk_description","mitigation","change_impact","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["risk_category"] not in WTP_RISK_CATEGORIES:
+        raise ValueError(f"risk_category moet een van {', '.join(WTP_RISK_CATEGORIES)} zijn")
+    if data.get("evidence_status") not in (None,"") and data["evidence_status"] not in WTP_RISK_EVIDENCE_STATUSES:
+        raise ValueError(f"evidence_status moet een van {', '.join(WTP_RISK_EVIDENCE_STATUSES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["risk_category"]))))
+    pid=data.get("id") or f"wtp-risk-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k); return (str(v).strip() if v is not None else None) or None
+    affected_v=opt("affected_roles"); required_data_v=opt("required_data"); missing_v=opt("missing_interfaces")
+    milestone_v=opt("critical_milestone"); status_v=opt("evidence_status")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM wtp_risks WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO wtp_risks(id,version,customer_id,fund_ref,risk_category,risk_description,mitigation,change_impact,affected_roles,required_data,missing_interfaces,critical_milestone,evidence_status,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),data["risk_category"].strip(),data["risk_description"].strip(),data["mitigation"].strip(),data["change_impact"].strip(),affected_v,required_data_v,missing_v,milestone_v,status_v,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"wtp_risks",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"risk_category":data["risk_category"]})
+    with connect() as db: saved=db.execute("SELECT * FROM wtp_risks WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+# Aliases for naming variants
+wtp_risk_controls = wtp_risks
+save_wtp_risk_control = save_wtp_risk
+wtp_changes = wtp_risks
+save_wtp_change = save_wtp_risk
+wtp_transition_risks = wtp_risks
+save_wtp_transition_risk = save_wtp_risk
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
