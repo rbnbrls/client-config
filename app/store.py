@@ -135,6 +135,19 @@ def init():
           CREATE INDEX IF NOT EXISTS document_reference_subject ON document_references(subject_type,subject_id,subject_version);
           CREATE TRIGGER IF NOT EXISTS document_reference_no_update BEFORE UPDATE ON document_references BEGIN SELECT RAISE(ABORT,'document references are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS document_reference_no_delete BEFORE DELETE ON document_references BEGIN SELECT RAISE(ABORT,'document references are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS activity_register(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          activity_code TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL,
+          boundaries TEXT NOT NULL, services TEXT NOT NULL, fund_mandate_ref TEXT,
+          criticality TEXT NOT NULL, materiality TEXT NOT NULL, owner TEXT NOT NULL,
+          contract_start TEXT NOT NULL, contract_end TEXT,
+          source_ref TEXT NOT NULL, effective_from TEXT NOT NULL, effective_to TEXT,
+          rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS activity_register_customer ON activity_register(customer_id,id,version);
+          CREATE TRIGGER IF NOT EXISTS activity_register_no_update BEFORE UPDATE ON activity_register BEGIN SELECT RAISE(ABORT,'activity register entries are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS activity_register_no_delete BEFORE DELETE ON activity_register BEGIN SELECT RAISE(ABORT,'activity register entries are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -844,3 +857,100 @@ def save_document_reference(data):
         db.execute("INSERT INTO document_references(id,version,subject_type,subject_id,subject_version,document_type,document_date,owner,confidentiality,retention_class,storage_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(ref_id,version,data["subject_type"].strip(),data["subject_id"].strip(),subject_version,data["document_type"],data["document_date"],data["owner"].strip(),data["confidentiality"],data["retention_class"],storage_ref,data["rationale"].strip(),actor,stamp))
         audit(db,"document_reference",ref_id,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"subject_type":data["subject_type"],"subject_id":data["subject_id"],"subject_version":subject_version,"document_type":data["document_type"],"document_date":data["document_date"],"owner":data["owner"],"confidentiality":data["confidentiality"],"retention_class":data["retention_class"],"storage_ref":storage_ref})
     return next(r for r in document_references(subject_id=data["subject_id"]) if r["id"]==ref_id)
+
+# OUT-001: Activiteitregister — per relatie werkzaamheden, grenzen, diensten,
+# fonds-/mandaatrelatie, kritikaliteit/materialiteit, eigenaar en contractperiode.
+ACTIVITY_CRITICALITY={"laag","gemiddeld","hoog"}
+ACTIVITY_MATERIALITY={"immatérieel","materieel","zeer materieel"}
+
+def activities(customer_id=None, valid_at=None, known_at=None):
+    if valid_at is not None and known_at is not None:
+        return _activities_as_of(customer_id,valid_at,known_at)
+    query="SELECT a.* FROM activity_register a JOIN (SELECT id,MAX(version) version FROM activity_register GROUP BY id) latest ON a.id=latest.id AND a.version=latest.version"
+    clauses=[];args=[]
+    if customer_id: clauses.append("a.customer_id=?");args.append(customer_id)
+    if clauses: query+=" WHERE "+" AND ".join(clauses)
+    query+=" ORDER BY a.created_at DESC"
+    with connect() as db: rows=db.execute(query,args).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row); item["services"]=json.loads(item["services"])
+        if item["fund_mandate_ref"] is None: item["fund_mandate_ref"]=""
+        result.append(item)
+    return result
+
+def _activities_as_of(customer_id,valid_at,known_at):
+    valid_at=valid_at or datetime.now(timezone.utc).date().isoformat()
+    known_stamp=_utc_stamp(known_at or now())
+    query="SELECT * FROM activity_register WHERE created_at<=?"
+    clauses=[];args=[known_stamp]
+    if customer_id: clauses.append("customer_id=?");args.append(customer_id)
+    if clauses: query+=" AND "+" AND ".join(clauses)
+    query+=" ORDER BY id,version"
+    with connect() as db: rows=db.execute(query,args).fetchall()
+    grouped={}
+    for row in rows:
+        item=dict(row)
+        if item["effective_from"]>valid_at: continue
+        if item["effective_to"] and item["effective_to"]<=valid_at: continue
+        prior=grouped.get(item["id"])
+        if not prior or item["version"]>prior["version"]: grouped[item["id"]]=item
+    result=[]
+    for item in grouped.values():
+        item["services"]=json.loads(item["services"])
+        if item["fund_mandate_ref"] is None: item["fund_mandate_ref"]=""
+        result.append(item)
+    return sorted(result,key=lambda a:(a["activity_code"],a["id"]))
+
+def save_activity(data):
+    required=("customer_id","activity_code","title","description","boundaries","services","fund_mandate_ref","criticality","materiality","owner","contract_start","source_ref","rationale","effective_from")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["criticality"] not in ACTIVITY_CRITICALITY: raise ValueError("Kritikaliteit moet laag, gemiddeld of hoog zijn")
+    if data["materiality"] not in ACTIVITY_MATERIALITY: raise ValueError("Materialiteit moet immatérieel, materieel of zeer materieel zijn")
+    services=data["services"]
+    if isinstance(services,str):
+        try: services=json.loads(services)
+        except ValueError: services=[s.strip() for s in services.split(",") if s.strip()]
+    if not isinstance(services,list) or not services or not all(isinstance(s,str) and s.strip() for s in services): raise ValueError("services moet een niet-lege lijst met dienstnamen zijn")
+    try:
+        date.fromisoformat(data["effective_from"]); date.fromisoformat(data["contract_start"])
+        if data.get("contract_end"): date.fromisoformat(data["contract_end"])
+    except ValueError: raise ValueError("Geldigheids- en contractdatums moeten ISO-formaat YYYY-MM-DD hebben")
+    if data.get("contract_end") and data["contract_end"]<data["contract_start"]: raise ValueError("Contracteind moet op of na de contractstart liggen")
+    aid=data.get("id") or "act-"+re.sub(r"[^a-z0-9]+","-",f"{data['customer_id']}-{data['activity_code']}".lower()).strip("-")
+    actor=data.get("actor","demo.client-service").strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM activity_register WHERE id=? AND customer_id=?",(aid,data["customer_id"])).fetchone()["version"]
+        if previous is None and data.get("id"): raise ValueError("Activiteit voor deze klant niet gevonden")
+        version=(previous or 0)+1
+        db.execute("INSERT INTO activity_register VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(aid,version,data["customer_id"],data["activity_code"].strip(),data["title"].strip(),data["description"].strip(),data["boundaries"].strip(),json.dumps(services),data["fund_mandate_ref"].strip(),data["criticality"],data["materiality"],data["owner"].strip(),data["contract_start"],data.get("contract_end") or None,data["source_ref"].strip(),data["effective_from"],data.get("effective_to") or None,data["rationale"].strip(),actor,stamp))
+        audit(db,"activity_register",aid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"activity_code":data["activity_code"],"owner":data["owner"],"services":services,"criticality":data["criticality"],"materiality":data["materiality"],"contract_start":data["contract_start"],"contract_end":data.get("contract_end")})
+    with connect() as db: saved=db.execute("SELECT * FROM activity_register WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(aid,data["customer_id"])).fetchone()
+    item=dict(saved); item["services"]=json.loads(item["services"])
+    return item
+
+def activity_chain(customer_id,activity_id,valid_at=None,known_at=None):
+    """Volledige keten voor een fonds-/mandaatwijziging: activiteit, diensten,
+    afhankelijkheden (relaties/DORA-assessments), missende contractvelden en
+    review-/meldstatus. Thresholds en statussen zijn signals, geen blokkades."""
+    rows=activities(customer_id=customer_id,valid_at=valid_at,known_at=known_at)
+    match=[a for a in rows if a["id"]==activity_id]
+    if not match: raise ValueError("Activiteit niet gevonden voor deze klant")
+    activity=match[0]
+    missing=[f for f in ("owner","contract_start","contract_end","fund_mandate_ref") if not str(activity.get(f) or "").strip()]
+    dependencies={"entity_relationships":[],"dora_assessments":[]}
+    try:
+        dependencies["entity_relationships"]=[r for r in client_relationships(customer_id,valid_at=valid_at,known_at=known_at) if activity["activity_code"].lower() in str(r.get("service_scope","")).lower()]
+    except Exception: pass
+    try:
+        dependencies["dora_assessments"]=[d for d in dora_assessments(valid_at=valid_at,known_at=known_at,customer_id=customer_id) if d.get("service_name") in activity["services"]]
+    except Exception: pass
+    # Review-/meldstatus: zonder gevalideerde Compliance/Legal-beoordeling is dit
+    # een open gate — pending, nooit geclaimd compleet.
+    review_status="pending"
+    return {"customer_id":customer_id,"activity":activity,"services":activity["services"],
+            "fund_mandate_ref":activity["fund_mandate_ref"],"missing_contract_fields":missing,
+            "dependencies":dependencies,"review_status":review_status,
+            "validation_note":"te valideren door Compliance/Legal voor relevante klant/partij"}

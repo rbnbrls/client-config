@@ -62,6 +62,18 @@ class Handler(BaseHTTPRequestHandler):
                 history=store.graph_knowledge_history(register_history.group(1))
                 return self.send_json(history) if history else self.send_json({"error":"not_found"},404)
             if path=="/api/dora-assessments":return self.send_json(store.dora_assessments())
+            if path=="/api/activities":return self.send_json(store.activities(customer_id=q.get("customer_id",[None])[0]))
+            if path=="/api/v1/activities":
+                valid_at=q.get("valid_at",[None])[0]; known_at=q.get("known_at",[None])[0]
+                if not valid_at or not known_at:return self.send_json({"error":"valid_at en known_at zijn verplicht"},400)
+                try: date.fromisoformat(valid_at); store._utc_stamp(known_at)
+                except ValueError:return self.send_json({"error":"Ongeldig datum- of tijdformaat"},400)
+                return self.send_json(store.activities(customer_id=q.get("customer_id",[None])[0],valid_at=valid_at,known_at=known_at))
+            chain_route=re.fullmatch(r"/api/customers/([\w-]+)/activity-chain/([\w-]+)",path)
+            if chain_route:
+                try: chain=store.activity_chain(customer_id=chain_route.group(1),activity_id=chain_route.group(2),valid_at=q.get("valid_at",[None])[0],known_at=q.get("known_at",[None])[0])
+                except ValueError as e: return self.send_json({"error":str(e)},404)
+                return self.send_json(chain)
             if path=="/api/v1/dora-assessments":
                 valid_at=q.get("valid_at",[None])[0]; known_at=q.get("known_at",[None])[0]
                 if not valid_at or not known_at:return self.send_json({"error":"valid_at en known_at zijn verplicht"},400)
@@ -124,6 +136,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(result)
             if path=="/api/client-requirements":return self.send_json(store.save_client_requirement(data),201)
             if path=="/api/dora-assessments":return self.send_json(store.save_dora_assessment(data),201)
+            if path=="/api/activities":
+                try: return self.send_json(store.save_activity(data),201)
+                except ValueError as e: return self.send_json({"error":str(e)},400)
             if path=="/api/client-entities":return self.send_json(store.save_client_entity(data),201)
             if path=="/api/client-relationships":return self.send_json(store.save_client_relationship(data),201)
             if path=="/api/changes":return self.send_json(store.create_change(data),201)
