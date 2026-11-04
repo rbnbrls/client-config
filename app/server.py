@@ -6,6 +6,16 @@ from datetime import date
 import json, os, re
 from . import store
 ROOT=Path(__file__).resolve().parent
+def build_version():
+    v=os.environ.get("CLIENT_CONFIG_BUILD_VERSION") or os.environ.get("BUILD_VERSION")
+    if v: return v
+    try:
+        import subprocess
+        out=subprocess.check_output(["git","rev-parse","--abbrev-ref","HEAD"],cwd=ROOT.parent,text=True,stderr=subprocess.DEVNULL).strip()
+        if out and out!="HEAD": return out
+    except Exception:
+        pass
+    return "unknown"
 class Handler(BaseHTTPRequestHandler):
     def send_json(self,data,status=200,headers=None):
         if status>=400:self.log_message("API response status=%s path=%s",status,urlparse(self.path).path)
@@ -18,6 +28,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed=urlparse(self.path); path=parsed.path; q=parse_qs(parsed.query)
         try:
             if path=="/api/health":return self.send_json({"status":"ok","service":"client-config-mvp"})
+            if path=="/api/v1/build-info":return self.send_json({"build_id":build_version()})
             if path=="/api/v1/config-schemas":return self.send_json(store.configuration_schemas())
             schema_match=re.fullmatch(r"/api/v1/config-schemas/(\d+)",path)
             if schema_match:
