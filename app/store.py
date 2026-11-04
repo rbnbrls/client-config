@@ -528,7 +528,10 @@ def save_client_relationship(data):
     with connect() as db: saved=db.execute("SELECT * FROM client_relationships WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(rid,data["customer_id"])).fetchone()
     return dict(saved)
 
-def policies(control_code=None):
+def policies(control_code=None, valid_at=None, known_at=None):
+    if valid_at is not None and known_at is not None:
+        rows=policies_as_of(valid_at,known_at,control_code=control_code)
+        return rows
     with connect() as db:
         if control_code:
             rows=db.execute("SELECT * FROM policy_controls WHERE control_code=? ORDER BY version DESC",(control_code,)).fetchall()
@@ -548,15 +551,18 @@ def policies(control_code=None):
             result.append(item)
     return result
 
-def policies_as_of(valid_at, known_at):
+def policies_as_of(valid_at, known_at, control_code=None):
     """Return policy versions effective at valid_at and recorded by known_at."""
-    known_stamp=_utc_stamp(known_at)
+    valid_at = valid_at or datetime.now(timezone.utc).date().isoformat()
+    known_stamp=_utc_stamp(known_at or now())
     with connect() as db:
         rows=db.execute("SELECT * FROM policy_controls WHERE created_at<=? ORDER BY control_code,effective_date,version",(known_stamp,)).fetchall()
     grouped={}
     for row in rows:
         item=dict(row)
-        if item["effective_date"]<=valid_at:
+        if item["control_code"] and control_code and item["control_code"]!=control_code.strip().upper():
+            continue
+        if valid_at is None or item["effective_date"]<=valid_at:
             prior=grouped.get(item["control_code"])
             if not prior or (item["effective_date"],item["version"])>(prior["effective_date"],prior["version"]):
                 grouped[item["control_code"]]=item
