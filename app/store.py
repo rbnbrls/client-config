@@ -298,6 +298,7 @@ def init():
           CREATE TRIGGER IF NOT EXISTS esg_contractual_flowdowns_no_update BEFORE UPDATE ON esg_contractual_flowdowns BEGIN SELECT RAISE(ABORT,'ESG contractual flowdowns are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS esg_contractual_flowdowns_no_delete BEFORE DELETE ON esg_contractual_flowdowns BEGIN SELECT RAISE(ABORT,'ESG contractual flowdowns are append-only'); END;''')
         db.executescript("CREATE TABLE IF NOT EXISTS esg_due_diligence_dossiers(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, workflow_step TEXT NOT NULL, impact_priority TEXT NOT NULL DEFAULT 'medium', finding TEXT NOT NULL, human_judgement TEXT NOT NULL, action_owner TEXT NOT NULL, deadline TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_due_diligence_dossiers_customer ON esg_due_diligence_dossiers(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_update BEFORE UPDATE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_delete BEFORE DELETE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END;")
+        db.executescript("CREATE TABLE IF NOT EXISTS esg_engagement_incidents(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, incident TEXT NOT NULL, source_ref TEXT NOT NULL, severity TEXT NOT NULL, engagement_relation TEXT NOT NULL, engagement_goal TEXT NOT NULL, progress TEXT NOT NULL DEFAULT 'open', actions TEXT, remediation TEXT, closure TEXT, retention_decision TEXT NOT NULL DEFAULT 'pending', rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_engagement_incidents_customer ON esg_engagement_incidents(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_update BEFORE UPDATE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_delete BEFORE DELETE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END;")
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -736,6 +737,9 @@ ESG_FLOWDOWN_CLAUSES=("oecd_ungp","due_diligence","cooperation","reporting","inc
 ESG_FLOWDOWN_TARGETS=("direct_manager","sub_manager")
 ESG_DD_WORKFLOW_STEPS=("policy_systems","impact_identification","prevention_mitigation","monitoring_results","communication","remediation")
 ESG_DD_IMPACT_PRIORITIES=("high","medium","low")
+ESG_ENGAGEMENT_SEVERITIES=("high","medium","low")
+ESG_ENGAGEMENT_PROGRESS=("open","in_progress","remediated","closed")
+ESG_ENGAGEMENT_RETENTION_DECISIONS=("retain","exit","pending")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1060,6 +1064,46 @@ def esg_due_diligence_dossiers(customer_id=None, fund_ref=None, manager_ref=None
     if valid_at:
         for r in result:
             r["validity_status"]="active" if r["deadline"]>=valid_at else "overdue"
+    return result
+
+def save_esg_engagement_incident(data):
+    required=("customer_id","fund_ref","manager_ref","incident","source_ref","severity","engagement_relation","engagement_goal","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    sev=data["severity"].strip()
+    if sev not in ESG_ENGAGEMENT_SEVERITIES: raise ValueError(f"severity moet een van {', '.join(ESG_ENGAGEMENT_SEVERITIES)} zijn")
+    progress=(data.get("progress") or "open").strip()
+    if progress not in ESG_ENGAGEMENT_PROGRESS: raise ValueError(f"progress moet een van {', '.join(ESG_ENGAGEMENT_PROGRESS)} zijn")
+    retention=(data.get("retention_decision") or "pending").strip()
+    if retention not in ESG_ENGAGEMENT_RETENTION_DECISIONS: raise ValueError(f"retention_decision moet een van {', '.join(ESG_ENGAGEMENT_RETENTION_DECISIONS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["manager_ref"]),str(data["incident"]))))
+    pid=data.get("id") or f"esgei-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM esg_engagement_incidents WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO esg_engagement_incidents(id,version,customer_id,fund_ref,manager_ref,incident,source_ref,severity,engagement_relation,engagement_goal,progress,actions,remediation,closure,retention_decision,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["fund_ref"]).strip(),str(data["manager_ref"]).strip(),data["incident"].strip(),data["source_ref"].strip(),sev,data["engagement_relation"].strip(),data["engagement_goal"].strip(),progress,(data.get("actions") or "").strip() or None,(data.get("remediation") or "").strip() or None,(data.get("closure") or "").strip() or None,retention,data["rationale"].strip(),actor,stamp))
+        audit(db,"esg_engagement_incident",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"manager_ref":data["manager_ref"],"severity":sev,"progress":progress,"retention_decision":retention,"source_ref":data["source_ref"].strip()})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_engagement_incidents WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def esg_engagement_incidents(customer_id=None, fund_ref=None, manager_ref=None, severity=None, progress=None, valid_at=None):
+    with connect() as db:
+        q="SELECT * FROM esg_engagement_incidents WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        if severity: q+=" AND severity=?"; params.append(severity)
+        if progress: q+=" AND progress=?"; params.append(progress)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    result=[dict(r) for r in rows]
+    if valid_at:
+        for r in result:
+            r["validity_status"]="active" if r["progress"]!="closed" else "closed"
     return result
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
