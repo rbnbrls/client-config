@@ -299,6 +299,7 @@ def init():
           CREATE TRIGGER IF NOT EXISTS esg_contractual_flowdowns_no_delete BEFORE DELETE ON esg_contractual_flowdowns BEGIN SELECT RAISE(ABORT,'ESG contractual flowdowns are append-only'); END;''')
         db.executescript("CREATE TABLE IF NOT EXISTS esg_due_diligence_dossiers(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, workflow_step TEXT NOT NULL, impact_priority TEXT NOT NULL DEFAULT 'medium', finding TEXT NOT NULL, human_judgement TEXT NOT NULL, action_owner TEXT NOT NULL, deadline TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_due_diligence_dossiers_customer ON esg_due_diligence_dossiers(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_update BEFORE UPDATE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_delete BEFORE DELETE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END;")
         db.executescript("CREATE TABLE IF NOT EXISTS esg_engagement_incidents(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, incident TEXT NOT NULL, source_ref TEXT NOT NULL, severity TEXT NOT NULL, engagement_relation TEXT NOT NULL, engagement_goal TEXT NOT NULL, progress TEXT NOT NULL DEFAULT 'open', actions TEXT, remediation TEXT, closure TEXT, retention_decision TEXT NOT NULL DEFAULT 'pending', rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_engagement_incidents_customer ON esg_engagement_incidents(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_update BEFORE UPDATE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_engagement_incidents_no_delete BEFORE DELETE ON esg_engagement_incidents BEGIN SELECT RAISE(ABORT,'ESG engagement incidents are append-only'); END;")
+        db.executescript("CREATE TABLE IF NOT EXISTS esg_periodic_reviews(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, review_period TEXT NOT NULL DEFAULT 'annual', esg_risks TEXT NOT NULL, results TEXT NOT NULL, improvement_actions TEXT, deviation TEXT NOT NULL DEFAULT 'none', deviation_rationale TEXT, approver TEXT, end_date TEXT, escalation TEXT NOT NULL DEFAULT 'none', source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_periodic_reviews_customer ON esg_periodic_reviews(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_periodic_reviews_no_update BEFORE UPDATE ON esg_periodic_reviews BEGIN SELECT RAISE(ABORT,'ESG periodic reviews are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_periodic_reviews_no_delete BEFORE DELETE ON esg_periodic_reviews BEGIN SELECT RAISE(ABORT,'ESG periodic reviews are append-only'); END;")
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -740,6 +741,9 @@ ESG_DD_IMPACT_PRIORITIES=("high","medium","low")
 ESG_ENGAGEMENT_SEVERITIES=("high","medium","low")
 ESG_ENGAGEMENT_PROGRESS=("open","in_progress","remediated","closed")
 ESG_ENGAGEMENT_RETENTION_DECISIONS=("retain","exit","pending")
+ESG_REVIEW_PERIODS=("annual","client_agreed")
+ESG_REVIEW_DEVIATIONS=("none","deviation","deferral")
+ESG_REVIEW_ESCALATIONS=("none","escalated")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1104,6 +1108,53 @@ def esg_engagement_incidents(customer_id=None, fund_ref=None, manager_ref=None, 
     if valid_at:
         for r in result:
             r["validity_status"]="active" if r["progress"]!="closed" else "closed"
+    return result
+
+def save_esg_periodic_review(data):
+    required=("customer_id","fund_ref","manager_ref","esg_risks","results","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    period=(data.get("review_period") or "annual").strip()
+    if period not in ESG_REVIEW_PERIODS: raise ValueError(f"review_period moet een van {', '.join(ESG_REVIEW_PERIODS)} zijn")
+    deviation=(data.get("deviation") or "none").strip()
+    if deviation not in ESG_REVIEW_DEVIATIONS: raise ValueError(f"deviation moet een van {', '.join(ESG_REVIEW_DEVIATIONS)} zijn")
+    escalation=(data.get("escalation") or "none").strip()
+    if escalation not in ESG_REVIEW_ESCALATIONS: raise ValueError(f"escalation moet een van {', '.join(ESG_REVIEW_ESCALATIONS)} zijn")
+    if deviation in ("deviation","deferral") and (not data.get("deviation_rationale") or not str(data["deviation_rationale"]).strip()):
+        raise ValueError("deviation_rationale is verplicht bij afwijking/uitstel")
+    if deviation in ("deviation","deferral") and (not data.get("approver") or not str(data["approver"]).strip()):
+        raise ValueError("approver is verplicht bij afwijking/uitstel")
+    if deviation in ("deviation","deferral") and (not data.get("end_date") or not str(data["end_date"]).strip()):
+        raise ValueError("end_date is verplicht bij afwijking/uitstel")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["manager_ref"]),str(data.get("review_period","annual")))))
+    pid=data.get("id") or f"esgpr-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM esg_periodic_reviews WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO esg_periodic_reviews(id,version,customer_id,fund_ref,manager_ref,review_period,esg_risks,results,improvement_actions,deviation,deviation_rationale,approver,end_date,escalation,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["fund_ref"]).strip(),str(data["manager_ref"]).strip(),period,data["esg_risks"].strip(),data["results"].strip(),(data.get("improvement_actions") or "").strip() or None,deviation,(data.get("deviation_rationale") or "").strip() or None,(data.get("approver") or "").strip() or None,(data.get("end_date") or "").strip() or None,escalation,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"esg_periodic_review",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"manager_ref":data["manager_ref"],"review_period":period,"deviation":deviation,"escalation":escalation,"source_ref":data["source_ref"].strip()})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_periodic_reviews WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def esg_periodic_reviews(customer_id=None, fund_ref=None, manager_ref=None, review_period=None, deviation=None, escalation=None, valid_at=None):
+    with connect() as db:
+        q="SELECT * FROM esg_periodic_reviews WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        if review_period: q+=" AND review_period=?"; params.append(review_period)
+        if deviation: q+=" AND deviation=?"; params.append(deviation)
+        if escalation: q+=" AND escalation=?"; params.append(escalation)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    result=[dict(r) for r in rows]
+    if valid_at:
+        for r in result:
+            r["validity_status"]="active" if r["deviation"]!="deferral" else "deferred"
     return result
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
