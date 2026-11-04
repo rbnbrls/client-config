@@ -554,6 +554,43 @@ def policies_as_of(valid_at, known_at):
             result.append(item)
     return sorted(result,key=lambda policy:policy["control_code"])
 
+def hard_block(control_code, version=None):
+    """Evaluate whether a policy control may act as a hard block.
+
+    A hard block is REFUSED (ValueError) unless the control has enforcement
+    level ``hard``, a derived validation status of ``validated`` and evidence:
+    a validated policy decision that cites a source review plus a rationale.
+    Soft/manual controls never block by design.
+    """
+    items = policies(control_code)
+    if not items: raise ValueError("Policycontrol niet gevonden")
+    policy = items[0] if version is None else next((p for p in items if p["version"]==int(version)),None)
+    if not policy: raise ValueError(f"Policyversie {version} van {control_code} niet gevonden")
+    if policy["enforcement"]!="hard":
+        return {"control_code":policy["control_code"],"version":policy["version"],"blocking":False,"reason":"Handhavingsniveau is niet hard; dit control blokkeert nooit"}
+    if policy["validation_status"]!="validated":
+        raise ValueError("Harde blokkade geweigerd: validatiestatus is niet 'validated' (te valideren door Compliance/Legal)")
+    decision=policy["decision"]
+    if not decision or not decision.get("source_review_id") or not str(decision.get("rationale","")).strip():
+        raise ValueError("Harde blokkade geweigerd: geen bewijs in de vorm van een gevalideerd besluit met geverifieerde bronreview en motivering")
+    return {"control_code":policy["control_code"],"version":policy["version"],"blocking":True,"decision_id":decision["id"],"source_review_id":decision["source_review_id"]}
+
+def policy_signals():
+    """Non-blocking signals for policy controls that are not (yet) validated.
+
+    Unapproved interpretations must surface as signals, never as hard blocks:
+    every control whose derived validation status is not 'validated' — plus
+    every control past its review date — yields a severity='signal' entry.
+    """
+    signals=[]
+    today=datetime.now(timezone.utc).date().isoformat()
+    for p in policies():
+        if p["validation_status"]!="validated":
+            signals.append({"control_code":p["control_code"],"version":p["version"],"enforcement":p["enforcement"],"severity":"signal","code":"POLICY_NOT_VALIDATED","message":"Interpretatie nog niet gevalideerd via bronreview en besluit; dit is een niet-blokkerend signaal.","blocking":False})
+        if p["review_date"]<=today:
+            signals.append({"control_code":p["control_code"],"version":p["version"],"enforcement":p["enforcement"],"severity":"signal","code":"POLICY_REVIEW_DUE","message":f"Reviewdatum {p['review_date']} is verstreken; menselijke review vereist.","blocking":False})
+    return signals
+
 def save_policy(data, control_code=None):
     required=("control_code","title","owner","audience","source_ref","applicability","enforcement","effective_date","review_date")
     if not control_code and not data.get("control_code","").strip(): raise ValueError("Controlcode is verplicht")
