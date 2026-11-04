@@ -480,6 +480,19 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS fee_simulation_customer ON fee_simulation(customer_id,fund_ref,level,version);
             CREATE TRIGGER IF NOT EXISTS fee_simulation_no_update BEFORE UPDATE ON fee_simulation BEGIN SELECT RAISE(ABORT,'fee simulation is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS fee_simulation_no_delete BEFORE DELETE ON fee_simulation BEGIN SELECT RAISE(ABORT,'fee simulation is append-only'); END;''')
+        # TWIN-002 Isolatie en reproduceerbaarheid: scenario snapshots (append-only)
+        db.executescript('''CREATE TABLE IF NOT EXISTS scenario_snapshots(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            scenario_name TEXT NOT NULL,
+            snapshot TEXT NOT NULL, inputs TEXT NOT NULL,
+            calc_logic_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL,
+            outcome TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS scenario_snapshots_customer ON scenario_snapshots(customer_id,scenario_name,version);
+            CREATE TRIGGER IF NOT EXISTS scenario_snapshots_no_update BEFORE UPDATE ON scenario_snapshots BEGIN SELECT RAISE(ABORT,'scenario snapshots are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS scenario_snapshots_no_delete BEFORE DELETE ON scenario_snapshots BEGIN SELECT RAISE(ABORT,'scenario snapshots are append-only'); END;''')
         # FEE-003 Kostenoverzicht
         db.executescript('''CREATE TABLE IF NOT EXISTS cost_overview(
             id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -1979,14 +1992,63 @@ save_fee_simulations=save_fee_simulation
 fee_simulations=fee_simulation
 fee_simulations_export=fee_simulation_export
 
+# TWIN-002 Isolatie en reproduceerbaarheid
+import json as _json
+
+def save_scenario_snapshot(data):
+    required=("customer_id","scenario_name","snapshot","inputs","calc_logic_version","policy_version","schema_version")
+    for key in required:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",str(s).lower()).strip("-") for s in (data["customer_id"],data["scenario_name"])))
+    pid=data.get("id") or f"scenario-{slug}"
+    actor=data.get("actor","demo.client-service")
+    if not str(actor).strip(): actor="demo.client-service"
+    actor=str(actor).strip()
+    stamp=now(); cid=data["customer_id"]
+    snapshot=data["snapshot"]
+    inputs=data["inputs"]
+    if not isinstance(snapshot,(dict,list,str)): raise ValueError("snapshot ongeldig")
+    if not isinstance(inputs,(dict,list,str)): raise ValueError("inputs ongeldig")
+    snapshot_json=snapshot if isinstance(snapshot,str) else _json.dumps(snapshot,sort_keys=True)
+    inputs_json=inputs if isinstance(inputs,str) else _json.dumps(inputs,sort_keys=True)
+    # deterministic outcome derived from snapshot+inputs+versions (reproducible)
+    outcome=_json.dumps({"snapshot":snapshot_json,"inputs":inputs_json,
+        "calc_logic_version":data["calc_logic_version"],"policy_version":data["policy_version"],
+        "schema_version":data["schema_version"]},sort_keys=True)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM scenario_snapshots WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO scenario_snapshots(id,version,customer_id,scenario_name,snapshot,inputs,calc_logic_version,policy_version,schema_version,outcome,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["scenario_name"].strip() if isinstance(data["scenario_name"],str) else str(data["scenario_name"]),snapshot_json,inputs_json,
+           str(data["calc_logic_version"]).strip(),str(data["policy_version"]).strip(),str(data["schema_version"]).strip(),outcome,actor,stamp))
+        audit(db,"scenario_snapshot",pid,"created" if version==1 else "versioned",actor,"scenario snapshot",{"customer_id":cid,"version":version})
+    with connect() as db: saved=db.execute("SELECT * FROM scenario_snapshots WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def scenario_snapshots(customer_id=None, scenario_name=None):
+    with connect() as db:
+        q="SELECT * FROM scenario_snapshots WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if scenario_name: q+=" AND scenario_name=?"; params.append(scenario_name)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def scenario_snapshot_export(customer_id=None, scenario_name=None):
+    rows=scenario_snapshots(customer_id=customer_id,scenario_name=scenario_name)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"scenario_name":scenario_name},"coverage":len(rows),"rows":rows}
+
+# aliases
+save_scenario_snapshots=save_scenario_snapshot
+scenario_snapshot=scenario_snapshots
+wtp_risk_controls = wtp_risks
+wtp_changes = wtp_risks
+save_wtp_change = save_wtp_risk
 def fee_components_export(customer_id=None, fund_ref=None):
     rows=fee_components(customer_id=customer_id,fund_ref=fund_ref)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},
            "coverage":len(rows),"rows":rows}
-wtp_risk_controls = wtp_risks
-save_wtp_risk_control = save_wtp_risk
-wtp_changes = wtp_risks
-save_wtp_change = save_wtp_risk
 wtp_transition_risks = wtp_risks
 save_wtp_transition_risk = save_wtp_risk
 
