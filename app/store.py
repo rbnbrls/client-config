@@ -234,6 +234,38 @@ def init():
           CREATE INDEX IF NOT EXISTS notification_signals_customer ON notification_signals(customer_id,fund_ref,version);
           CREATE TRIGGER IF NOT EXISTS notification_signals_no_update BEFORE UPDATE ON notification_signals BEGIN SELECT RAISE(ABORT,'notification signals are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS notification_signals_no_delete BEFORE DELETE ON notification_signals BEGIN SELECT RAISE(ABORT,'notification signals are append-only'); END;''')
+        # ESG-001 Beleidsprofiel: per klant/fonds en mandaat het geldende MVB/ESG-beleid, doelen,
+        # prioriteit (rendement/risico/duurzaamheid), asset-class scope, versie en bronbewijs.
+        # De IMVB-invulling leeft hier per klant/fonds; het verlopen IMVB-convenant wordt niet als
+        # zelfstandige actuele wettelijke verplichting gemodelleerd (validatienotitie fase P3).
+        db.executescript('''CREATE TABLE IF NOT EXISTS esg_policy_profiles(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          fund_ref TEXT NOT NULL, subject_type TEXT NOT NULL, subject_id TEXT,
+          policy_framework TEXT NOT NULL, goals TEXT NOT NULL, priority TEXT NOT NULL,
+          asset_class_scope TEXT NOT NULL, oeso_ungp_diligence TEXT, imvb_diligence TEXT,
+          assessment_methodology TEXT, esg_rating_source TEXT, decision_thresholds TEXT,
+          policy_document_version TEXT, evidence_ref TEXT,
+          effective_from TEXT NOT NULL, effective_to TEXT, review_cycle TEXT, next_review_at TEXT,
+          source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS esg_policy_profiles_customer ON esg_policy_profiles(customer_id,fund_ref,version);
+          CREATE TRIGGER IF NOT EXISTS esg_policy_profiles_no_update BEFORE UPDATE ON esg_policy_profiles BEGIN SELECT RAISE(ABORT,'ESG policy profiles are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS esg_policy_profiles_no_delete BEFORE DELETE ON esg_policy_profiles BEGIN SELECT RAISE(ABORT,'ESG policy profiles are append-only'); END;
+          CREATE TABLE IF NOT EXISTS esg_policy_exceptions(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          customer_id TEXT NOT NULL REFERENCES customers(id),
+          profile_id TEXT NOT NULL,
+          fund_ref TEXT, subject_type TEXT, subject_id TEXT,
+          description TEXT NOT NULL, rationale TEXT NOT NULL, approver TEXT NOT NULL,
+          scope_description TEXT, effective_from TEXT, end_date TEXT NOT NULL,
+          evidence_ref TEXT, source_ref TEXT,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS esg_policy_exceptions_customer ON esg_policy_exceptions(customer_id,profile_id,version);
+          CREATE TRIGGER IF NOT EXISTS esg_policy_exceptions_no_update BEFORE UPDATE ON esg_policy_exceptions BEGIN SELECT RAISE(ABORT,'ESG policy exceptions are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS esg_policy_exceptions_no_delete BEFORE DELETE ON esg_policy_exceptions BEGIN SELECT RAISE(ABORT,'ESG policy exceptions are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -658,6 +690,185 @@ def save_governance_policy(data):
         db.execute("INSERT INTO governance_policies(id,version,customer_id,policy,monitoring_frequency,reporting,escalation,independent_evaluation,capacity,evaluation_date,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,customer_id,data["policy"].strip(),data["monitoring_frequency"].strip(),data["reporting"].strip(),data["escalation"].strip(),data["independent_evaluation"].strip(),data["capacity"].strip(),data["evaluation_date"],data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
         audit(db,"governance_policy",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"customer_id":customer_id,"applicability":data["applicability"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
     return next(r for r in governance_policies() if r["id"]==rid)
+
+# --- ESG-001 Beleidsprofiel ---
+# Per klant/fonds en mandaat het geldende MVB/ESG-beleid, doelen, prioriteit (rendement/risico/
+# duurzaamheid), asset-class scope, versie en bronbewijs. Append-only versieer: een wijziging is
+# per definitie nieuwe versie; de impactreview toont welke managers/mandaten en rapportageprofielen
+# geraakt worden.
+ESG_POLICY_SUBJECT_TYPES=("fund","mandate","party")
+ESG_POLICY_PRIORITIES=("return","risk","sustainability","balanced")
+ESG_POLICY_IMPACT_FIELDS=("policy_framework","goals","priority","asset_class_scope","assessment_methodology","esg_rating_source","decision_thresholds")
+
+def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
+    """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
+    known_at=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("""SELECT g.* FROM esg_policy_profiles g JOIN
+          (SELECT id,MAX(version) version FROM esg_policy_profiles WHERE created_at<=? GROUP BY id) latest
+          ON g.id=latest.id AND g.version=latest.version
+          WHERE (? IS NULL OR g.customer_id=?) AND (? IS NULL OR g.fund_ref=?) ORDER BY g.created_at DESC""",
+          (known_at,customer_id,customer_id,fund_ref,fund_ref)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        if not item["effective_from"]: item["validity_status"]="unset_legacy"
+        elif valid_at and item["effective_from"]<=valid_at and (not item["effective_to"] or item["effective_to"]>valid_at): item["validity_status"]="valid"
+        elif valid_at: continue
+        else: item["validity_status"]="dated"
+        result.append(item)
+    return result
+
+def esg_policy_profile_in_force(customer_id, fund_ref, subject_type=None, subject_id=None, valid_at=None, known_at=None):
+    """Toepasselijke criteria zichtbaar en bewijsbaar bij manager onboarding en jaarlijkse review:
+    mandaatspecifiek profiel wint van het fondsdekkende standaardprofiel; bronbewijs (source_ref,
+    evidence_ref, beleidsdocumentversie) reist mee als evidence."""
+    candidates=esg_policy_profiles(valid_at=valid_at,known_at=known_at,customer_id=customer_id,fund_ref=fund_ref)
+    if not candidates: raise ValueError(f"Geen geldend ESG-beleidsprofiel voor {customer_id}/{fund_ref} op valid_at={valid_at or '*'} en known_at={known_at or '*'}")
+    specific=[r for r in candidates if subject_type and subject_id and r["subject_type"]==subject_type and r["subject_id"]==subject_id]
+    fund_default=[r for r in candidates if not r["subject_id"]]
+    if specific: item, resolved=dict(specific[0]),"mandate_specific"
+    elif fund_default: item, resolved=dict(fund_default[0]),"fund_default"
+    else: item, resolved=dict(candidates[0]),"fund_default"
+    item["resolved_from"]=resolved
+    item["evidence"]={"source_ref":item["source_ref"],"evidence_ref":item["evidence_ref"],
+        "policy_document_version":item["policy_document_version"],
+        "review_cycle":item["review_cycle"],"next_review_at":item["next_review_at"],"resolved_from":resolved}
+    return item
+
+def save_esg_policy_profile(data):
+    required=("customer_id","fund_ref","subject_type","policy_framework","goals","priority",
+              "asset_class_scope","effective_from","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["subject_type"] not in ESG_POLICY_SUBJECT_TYPES: raise ValueError(f"subject_type moet een van {', '.join(ESG_POLICY_SUBJECT_TYPES)} zijn")
+    if data["priority"] not in ESG_POLICY_PRIORITIES: raise ValueError(f"prioriteit moet een van {', '.join(ESG_POLICY_PRIORITIES)} zijn")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["effective_from"]): raise ValueError
+        date.fromisoformat(data["effective_from"])
+        effective_to=(data.get("effective_to") or "").strip() or None
+        if effective_to and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}",effective_to) or date.fromisoformat(effective_to)<=date.fromisoformat(data["effective_from"])): raise ValueError
+        next_review_at=(data.get("next_review_at") or "").strip() or None
+        if next_review_at:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",next_review_at): raise ValueError
+            date.fromisoformat(next_review_at)
+    except ValueError: raise ValueError("Geldigheids- en reviewdatum moeten ISO-formaat YYYY-MM-DD hebben; einddatum moet na de ingangsdatum liggen")
+    # Standaard-id namespaced per klant/fonds/onderwerp: dezelfde natuurlijke sleutel bij een
+    # andere klant mag nooit botsen op de globale PK (id,version).
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]))))
+    pid=data.get("id") or f"esgp-{slug}-{data['subject_type']}"+(f"-{re.sub(r'[^a-z0-9]+','-',str(data['subject_id']).lower()).strip('-')}" if data.get("subject_id") else "")
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM esg_policy_profiles WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO esg_policy_profiles(id,version,customer_id,fund_ref,subject_type,subject_id,
+          policy_framework,goals,priority,asset_class_scope,oeso_ungp_diligence,imvb_diligence,
+          assessment_methodology,esg_rating_source,decision_thresholds,policy_document_version,evidence_ref,
+          effective_from,effective_to,review_cycle,next_review_at,source_ref,rationale,created_by,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["fund_ref"]).strip(),data["subject_type"],(data.get("subject_id") or "").strip() or None,
+           data["policy_framework"].strip(),data["goals"].strip(),data["priority"],data["asset_class_scope"].strip(),
+           (data.get("oeso_ungp_diligence") or "").strip() or None,(data.get("imvb_diligence") or "").strip() or None,
+           (data.get("assessment_methodology") or "").strip() or None,(data.get("esg_rating_source") or "").strip() or None,
+           (data.get("decision_thresholds") or "").strip() or None,(data.get("policy_document_version") or "").strip() or None,
+           (data.get("evidence_ref") or "").strip() or None,
+           data["effective_from"],effective_to,(data.get("review_cycle") or "").strip() or None,next_review_at,
+           data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"esg_policy_profile",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"subject_type":data["subject_type"],
+             "subject_id":data.get("subject_id"),"priority":data["priority"],
+             "asset_class_scope":data["asset_class_scope"],"source_ref":data["source_ref"].strip(),
+             "effective_from":data["effective_from"],"effective_to":effective_to})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_policy_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def save_esg_policy_exception(data):
+    """Uitzondering op het geldende beleidsprofiel: rationale, goedkeurder en einddatum zijn verplicht; append-only."""
+    required=("customer_id","profile_id","description","rationale","approver","end_date")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["end_date"]): raise ValueError
+        date.fromisoformat(data["end_date"])
+        effective_from=(data.get("effective_from") or "").strip() or None
+        if effective_from and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}",effective_from) or date.fromisoformat(effective_from)>date.fromisoformat(data["end_date"])): raise ValueError
+    except ValueError: raise ValueError("Einddatum moet een ISO-datum YYYY-MM-DD zijn en na de ingangsdatum liggen")
+    cid=data["customer_id"]
+    with connect() as db:
+        profile=db.execute("SELECT * FROM esg_policy_profiles WHERE id=? AND customer_id=? ORDER BY version DESC",(data["profile_id"],cid)).fetchone()
+        if not profile: raise ValueError("Beleidsprofiel voor deze klant niet gevonden")
+        eid=data.get("id") or f"esgpe-{re.sub(r'[^a-z0-9]+','-',str(data['profile_id']).lower()).strip('-')}"
+        previous=db.execute("SELECT MAX(version) version FROM esg_policy_exceptions WHERE id=? AND customer_id=?",(eid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        actor=data.get("actor",data["approver"]).strip(); stamp=now()
+        fund_ref=(data.get("fund_ref") or "").strip() or profile["fund_ref"]
+        subject_type=(data.get("subject_type") or "").strip() or profile["subject_type"]
+        subject_id=(data.get("subject_id") or "").strip() or profile["subject_id"]
+        db.execute("""INSERT INTO esg_policy_exceptions(id,version,customer_id,profile_id,fund_ref,subject_type,subject_id,
+          description,rationale,approver,scope_description,effective_from,end_date,evidence_ref,source_ref,created_by,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (eid,version,cid,data["profile_id"],fund_ref,subject_type,subject_id,
+           data["description"].strip(),data["rationale"].strip(),data["approver"].strip(),
+           (data.get("scope_description") or "").strip() or None,effective_from,data["end_date"],
+           (data.get("evidence_ref") or "").strip() or None,(data.get("source_ref") or "").strip() or None,actor,stamp))
+        audit(db,"esg_policy_exception",eid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"profile_id":data["profile_id"],"approver":data["approver"],
+             "end_date":data["end_date"]})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_policy_exceptions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(eid,cid)).fetchone()
+    return dict(saved)
+
+def esg_policy_exceptions(valid_at=None, known_at=None, customer_id=None):
+    """Uitzonderingen met hun geldigheid: na de einddatum markeren we de rij als expired (geen hard delete)."""
+    known_at=_utc_stamp(known_at or now())
+    with connect() as db:
+        rows=db.execute("""SELECT e.* FROM esg_policy_exceptions e JOIN
+          (SELECT id,MAX(version) version FROM esg_policy_exceptions WHERE created_at<=? GROUP BY id) latest
+          ON e.id=latest.id AND e.version=latest.version
+          WHERE (? IS NULL OR e.customer_id=?) ORDER BY e.created_at DESC""",(known_at,customer_id,customer_id)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        if not valid_at: item["validity_status"]="unknown_without_valid_at"
+        elif item["end_date"]<valid_at: item["validity_status"]="expired"
+        else: item["validity_status"]="active"
+        result.append(item)
+    return result
+
+def esg_policy_change_impact(data):
+    """Wijziging van klantbeleid: toon welke managers/mandaten en rapportageprofielen geraakt worden.
+    Een profiel is geraakt wanneer een aangeleverd nieuw beleidsveld afwijkt van de waarde in het
+    in-kracht-profiel (afwijkende mandaten moeten herbeoordeeld of expliciet geünificeerd als
+    uitzondering); rapportageprofielen = rapportagevereisten van de klant + exportprofielen in gebruik."""
+    for key in ("customer_id",):
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    provided=[f for f in ESG_POLICY_IMPACT_FIELDS if str(data.get(f,"")).strip()]
+    if not provided: raise ValueError(f"Minimaal één nieuw beleidsveld is verplicht: {', '.join(ESG_POLICY_IMPACT_FIELDS)}")
+    cid=data["customer_id"]
+    if not customer(cid): raise ValueError("Klant niet gevonden")
+    actor=data.get("actor","demo.client-service").strip()
+    profiles=esg_policy_profiles(customer_id=cid,valid_at=data.get("valid_at"))
+    affected=[]; mandates=[]
+    for profile in profiles:
+        changed=[f for f in provided if profile.get(f)!=data[f].strip()]
+        if changed:
+            affected.append({"id":profile["id"],"version":profile["version"],"fund_ref":profile["fund_ref"],
+                "subject_type":profile["subject_type"],"subject_id":profile["subject_id"],"changed_fields":changed})
+            if profile["subject_id"]: mandates.append({"fund_ref":profile["fund_ref"],"subject_type":profile["subject_type"],"subject_id":profile["subject_id"]})
+    requirements=client_requirements(cid)
+    affected_reporting=[dict(r) for r in requirements if r["category"]=="reporting"]
+    with connect() as db:
+        export_profile_refs=[r["profile_id"] for r in db.execute("SELECT DISTINCT profile_id FROM exports WHERE customer_id=?",(cid,)).fetchall()]
+    with connect() as db:
+        audit(db,"esg_policy_profile",cid,"impact_reviewed",actor,data.get("rationale") or "beleidswijziging-impactreview",
+            {"customer_id":cid,"provided_fields":provided,"affected_profiles":len(affected),
+             "affected_reporting_requirements":len(affected_reporting),"affected_export_profiles":len(export_profile_refs)})
+    return {"customer_id":cid,"proposed":{f:data[f].strip() for f in provided},
+        "affected_profiles":affected,"affected_managers_mandates":mandates,
+        "affected_reporting_requirements":affected_reporting,
+        "affected_partner_export_profiles":export_profile_refs,
+        "unaffected_profile_count":len(profiles)-len(affected)}
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
     stamp=stamp or now()
