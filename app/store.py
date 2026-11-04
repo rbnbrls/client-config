@@ -559,22 +559,48 @@ def save_dora_assessment(data):
     return next(r for r in dora_assessments() if r["id"]==assessment_id)
 
 def ict_provider_relations(valid_at=None, known_at=None, customer_id=None):
+    known_at=_utc_stamp(known_at or now())
     with connect() as db:
-        q="SELECT * FROM ict_provider_relations"
-        params=[]
-        if customer_id:
-            q+=" WHERE customer_id=?"; params.append(customer_id)
-        q+=" ORDER BY id,version"
-        rows=db.execute(q,params).fetchall()
-    return [dict(r) for r in rows]
+        rows=db.execute("""SELECT i.* FROM ict_provider_relations i JOIN
+          (SELECT id,MAX(version) version FROM ict_provider_relations WHERE created_at<=? GROUP BY id) latest
+          ON i.id=latest.id AND i.version=latest.version
+          WHERE (? IS NULL OR i.customer_id=? OR i.customer_id IS NULL) ORDER BY i.created_at DESC""",(known_at,customer_id,customer_id)).fetchall()
+    result=[]
+    for row in rows:
+        item=dict(row)
+        if not item["effective_from"]: item["validity_status"]="unset_legacy"
+        elif valid_at and item["effective_from"]<=valid_at and (not item["effective_to"] or item["effective_to"]>valid_at): item["validity_status"]="valid"
+        elif valid_at: continue
+        else: item["validity_status"]="dated"
+        result.append(item)
+    return result
 
 def save_ict_provider_relation(data):
-    stamp=_utc_stamp(data.get("created_at"))
-    rid=data.get("id") or f"IPR-{abs(hash((data['provider'],data['ict_service'])))%100000:05d}"
+    required=("provider","ict_service","function_classification","contract_ref","incident_evidence","exit_evidence","applicability","source_ref","reviewer","reviewer_role","rationale","review_date","effective_from")
+    for key in required:
+        if not str(data.get(key,"")).strip():raise ValueError(f"{key} is verplicht")
+    function_classification={"critical","important","other"}
+    applicability={"pending_review","in_scope","out_of_scope"}
+    if data["function_classification"] not in function_classification:raise ValueError("Ongeldige functieclassificatie")
+    if data["applicability"] not in applicability:raise ValueError("Ongeldige toepasselijkheidsstatus")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["effective_from"]):raise ValueError
+        date.fromisoformat(data["effective_from"])
+        effective_to=(data.get("effective_to") or "").strip() or None
+        if effective_to and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}",effective_to) or date.fromisoformat(effective_to)<=date.fromisoformat(data["effective_from"])):raise ValueError
+    except ValueError:raise ValueError("Geldigheidsperiode moet ISO YYYY-MM-DD zijn; einddatum moet na startdatum liggen")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["review_date"]):raise ValueError("Geldigheids- en reviewdatum moeten ISO-formaat YYYY-MM-DD hebben")
+    date.fromisoformat(data["review_date"])
+    customer_id=(data.get("customer_id") or "").strip() or None
+    if customer_id and not customer(customer_id):raise ValueError("Klant niet gevonden")
+    role=data["reviewer_role"]
+    if role not in {"compliance","legal","risk","ict_risk"}:raise ValueError("Reviewerrol moet Compliance, Legal, Risk of ICT-risk zijn")
+    rid=data.get("id") or str(uuid.uuid4()); actor=data.get("actor",data["reviewer"]).strip(); stamp=now()
     with connect() as db:
-        prev=db.execute("SELECT MAX(version) v FROM ict_provider_relations WHERE id=?",(rid,)).fetchone()["v"]
-        version=(prev or 0)+1
-        db.execute("INSERT INTO ict_provider_relations(id,version,customer_id,provider,ict_service,function_classification,contract_ref,incident_evidence,exit_evidence,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,data.get("customer_id"),data["provider"].strip(),data["ict_service"].strip(),data["function_classification"],data["contract_ref"].strip(),data["incident_evidence"].strip(),data["exit_evidence"].strip(),data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),data["reviewer_role"],data["rationale"].strip(),data["review_date"],stamp,data.get("effective_from"),data.get("effective_to")))
+        previous=db.execute("SELECT MAX(version) version FROM ict_provider_relations WHERE id=?",(rid,)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO ict_provider_relations(id,version,customer_id,provider,ict_service,function_classification,contract_ref,incident_evidence,exit_evidence,applicability,source_ref,reviewer,reviewer_role,rationale,review_date,created_at,effective_from,effective_to) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,customer_id,data["provider"].strip(),data["ict_service"].strip(),data["function_classification"],data["contract_ref"].strip(),data["incident_evidence"].strip(),data["exit_evidence"].strip(),data["applicability"],data["source_ref"].strip(),data["reviewer"].strip(),role,data["rationale"].strip(),data["review_date"],stamp,data["effective_from"],effective_to))
+        audit(db,"ict_provider_relation",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"function_classification":data["function_classification"],"customer_id":customer_id,"applicability":data["applicability"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
     return next(r for r in ict_provider_relations() if r["id"]==rid)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
