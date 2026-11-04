@@ -454,6 +454,20 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS fee_calc_rules_customer ON fee_calculation_rules(customer_id,fund_ref,rule_name,version);
             CREATE TRIGGER IF NOT EXISTS fee_calc_rules_no_update BEFORE UPDATE ON fee_calculation_rules BEGIN SELECT RAISE(ABORT,'fee calculation rules are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS fee_calc_rules_no_delete BEFORE DELETE ON fee_calculation_rules BEGIN SELECT RAISE(ABORT,'fee calculation rules are append-only'); END;''')
+        # FEE-003 Kostenoverzicht
+        db.executescript('''CREATE TABLE IF NOT EXISTS cost_overview(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, mandate_ref TEXT, product_ref TEXT,
+            cost_type TEXT NOT NULL, source_ref TEXT NOT NULL, recipient TEXT NOT NULL,
+            period_start TEXT NOT NULL, period_end TEXT NOT NULL, perimeter TEXT NOT NULL,
+            amount REAL NOT NULL, currency TEXT NOT NULL, allocation_basis TEXT,
+            coverage_pct REAL, effective_from TEXT, effective_to TEXT,
+            rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS cost_overview_customer ON cost_overview(customer_id,fund_ref,cost_type,version);
+            CREATE TRIGGER IF NOT EXISTS cost_overview_no_update BEFORE UPDATE ON cost_overview BEGIN SELECT RAISE(ABORT,'cost overview is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS cost_overview_no_delete BEFORE DELETE ON cost_overview BEGIN SELECT RAISE(ABORT,'cost overview is append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -1807,12 +1821,54 @@ def fee_calculation_rules_export(customer_id=None, fund_ref=None):
     rows=fee_calculation_rules(customer_id=customer_id,fund_ref=fund_ref)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},"coverage":len(rows),"rows":rows}
 
+COST_OVERVIEW_TYPES=("direct_fee","performance_fee","other_agreed")
+PERIMETERS=("client","mandate","product")
+
+def save_cost_overview(data):
+    required=("customer_id","fund_ref","cost_type","source_ref","recipient","period_start","period_end","perimeter","amount","currency","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["cost_type"] not in COST_OVERVIEW_TYPES: raise ValueError(f"cost_type moet een van {', '.join(COST_OVERVIEW_TYPES)} zijn")
+    if data["currency"] not in FEE_CURRENCIES: raise ValueError(f"currency moet een van {', '.join(FEE_CURRENCIES)} zijn")
+    if data["perimeter"] not in PERIMETERS: raise ValueError(f"perimeter moet een van {', '.join(PERIMETERS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["cost_type"]),str(data["recipient"]),str(data["period_start"]),str(data["period_end"]))))
+    pid=data.get("id") or f"cost-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k); return (str(v).strip() if v is not None else None) or None
+    def optf(k):
+        v=data.get(k)
+        if v is None or v=="": return None
+        return float(v)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM cost_overview WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO cost_overview(id,version,customer_id,fund_ref,mandate_ref,product_ref,cost_type,source_ref,recipient,period_start,period_end,perimeter,amount,currency,allocation_basis,coverage_pct,effective_from,effective_to,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),opt("mandate_ref"),opt("product_ref"),data["cost_type"].strip(),data["source_ref"].strip(),data["recipient"].strip(),data["period_start"].strip(),data["period_end"].strip(),data["perimeter"].strip(),float(data["amount"]),data["currency"].strip(),opt("allocation_basis"),optf("coverage_pct"),opt("effective_from"),opt("effective_to"),data["rationale"].strip(),actor,stamp))
+        audit(db,"cost_overview",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),{"customer_id":cid,"version":version,"cost_type":data["cost_type"]})
+    with connect() as db: saved=db.execute("SELECT * FROM cost_overview WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def cost_overview(customer_id=None, fund_ref=None, cost_type=None, perimeter=None):
+    with connect() as db:
+        q="SELECT * FROM cost_overview WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if cost_type: q+=" AND cost_type=?"; params.append(cost_type)
+        if perimeter: q+=" AND perimeter=?"; params.append(perimeter)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def cost_overview_export(customer_id=None, fund_ref=None, perimeter=None):
+    rows=cost_overview(customer_id=customer_id,fund_ref=fund_ref,perimeter=perimeter)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref,"perimeter":perimeter},"coverage":len(rows),"rows":rows}
+
 def fee_components_export(customer_id=None, fund_ref=None):
     rows=fee_components(customer_id=customer_id,fund_ref=fund_ref)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref},
             "coverage":len(rows),"rows":rows}
-
-# Aliases for naming variants
 wtp_risk_controls = wtp_risks
 save_wtp_risk_control = save_wtp_risk
 wtp_changes = wtp_risks
