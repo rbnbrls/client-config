@@ -105,13 +105,17 @@ def init():
           effective_to TEXT, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
           created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version));
           CREATE INDEX IF NOT EXISTS client_entity_latest ON client_entities(customer_id,id,version);
+          CREATE TRIGGER IF NOT EXISTS client_entities_no_update BEFORE UPDATE ON client_entities BEGIN SELECT RAISE(ABORT,'client entities are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS client_entities_no_delete BEFORE DELETE ON client_entities BEGIN SELECT RAISE(ABORT,'client entities are append-only'); END;
           CREATE TABLE IF NOT EXISTS client_relationships(
           id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
           from_entity_id TEXT NOT NULL, to_entity_id TEXT NOT NULL, relationship_type TEXT NOT NULL,
           service_scope TEXT NOT NULL, effective_from TEXT NOT NULL, effective_to TEXT,
           source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL,
           created_at TEXT NOT NULL, PRIMARY KEY(id,version));
-          CREATE INDEX IF NOT EXISTS client_relationship_latest ON client_relationships(customer_id,id,version);''')
+          CREATE INDEX IF NOT EXISTS client_relationship_latest ON client_relationships(customer_id,id,version);
+          CREATE TRIGGER IF NOT EXISTS client_relationships_no_update BEFORE UPDATE ON client_relationships BEGIN SELECT RAISE(ABORT,'client relationships are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS client_relationships_no_delete BEFORE DELETE ON client_relationships BEGIN SELECT RAISE(ABORT,'client relationships are append-only'); END;''')
         db.executescript('''CREATE TABLE IF NOT EXISTS graph_knowledge_snapshots(
           id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id), revision INTEGER NOT NULL,
           recorded_at TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, timeline TEXT NOT NULL,
@@ -483,12 +487,13 @@ def save_client_entity(data):
     legal_id=(data.get("legal_identifier") or "").strip()
     # Legal identifiers are optional for synthetic/prototype records. No personal data belongs here.
     if data.get("effective_to") and data["effective_to"]<=data["effective_from"]:raise ValueError("Einddatum moet na de ingangsdatum liggen")
+    effective_to=data.get("effective_to") or None
     eid=data.get("id") or str(uuid.uuid4()); actor=data.get("actor","demo.client-service").strip(); stamp=now()
     with connect() as db:
         previous=db.execute("SELECT MAX(version) version FROM client_entities WHERE id=? AND customer_id=?",(eid,data["customer_id"])).fetchone()["version"]
         if previous is None and data.get("id"):raise ValueError("Entiteit voor deze klant niet gevonden")
         version=(previous or 0)+1
-        db.execute("INSERT INTO client_entities VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(eid,version,data["customer_id"],data["entity_type"],data["name"].strip(),legal_id,data["jurisdiction"].strip(),data["classification"].strip(),data["effective_from"],data.get("effective_to") or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        db.execute("INSERT INTO client_entities VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(eid,version,data["customer_id"],data["entity_type"],data["name"].strip(),legal_id,data["jurisdiction"].strip(),data["classification"].strip(),data["effective_from"],effective_to,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
         audit(db,"client_entity",eid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"entity_type":data["entity_type"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
         snapshot_graph_knowledge(db,data["customer_id"],actor,data["rationale"],stamp)
     with connect() as db: saved=db.execute("SELECT * FROM client_entities WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(eid,data["customer_id"])).fetchone()
@@ -511,12 +516,13 @@ def save_client_relationship(data):
     entities={e["id"] for e in client_entities(data["customer_id"])}
     if data["from_entity_id"] not in entities or data["to_entity_id"] not in entities:raise ValueError("Beide relatie-entiteiten moeten binnen dezelfde klantconfiguratie bestaan")
     if data.get("effective_to") and data["effective_to"]<=data["effective_from"]:raise ValueError("Einddatum moet na de ingangsdatum liggen")
+    effective_to=data.get("effective_to") or None
     rid=data.get("id") or str(uuid.uuid4());actor=data.get("actor","demo.client-service").strip();stamp=now()
     with connect() as db:
         previous=db.execute("SELECT MAX(version) version FROM client_relationships WHERE id=? AND customer_id=?",(rid,data["customer_id"])).fetchone()["version"]
         if previous is None and data.get("id"):raise ValueError("Relatie voor deze klant niet gevonden")
         version=(previous or 0)+1
-        db.execute("INSERT INTO client_relationships VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,data["customer_id"],data["from_entity_id"],data["to_entity_id"],data["relationship_type"],data["service_scope"].strip(),data["effective_from"],data.get("effective_to") or None,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        db.execute("INSERT INTO client_relationships VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(rid,version,data["customer_id"],data["from_entity_id"],data["to_entity_id"],data["relationship_type"],data["service_scope"].strip(),data["effective_from"],effective_to,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
         audit(db,"client_relationship",rid,"created" if version==1 else "versioned",actor,data["rationale"],{"customer_id":data["customer_id"],"version":version,"from_entity_id":data["from_entity_id"],"to_entity_id":data["to_entity_id"],"relationship_type":data["relationship_type"],"source_ref":data["source_ref"].strip(),"effective_from":data["effective_from"],"effective_to":effective_to})
         snapshot_graph_knowledge(db,data["customer_id"],actor,data["rationale"],stamp)
     with connect() as db: saved=db.execute("SELECT * FROM client_relationships WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(rid,data["customer_id"])).fetchone()
