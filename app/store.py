@@ -367,15 +367,28 @@ def init():
         # WTP-001 Transitieprofiel: fondsregeling/transitiefase, planning, scope, relevante
         # besluit-/go-live-/invaardata en eigenaar. Append-only versieer per fonds.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_transition_profiles(
-        id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
-        fund_ref TEXT NOT NULL, fund_regulation TEXT NOT NULL, transition_phase TEXT NOT NULL,
-        planning TEXT NOT NULL, scope TEXT NOT NULL, decision_date TEXT, golive_date TEXT, migration_date TEXT,
-        owner TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
-        created_by TEXT NOT NULL, created_at TEXT NOT NULL,
-        PRIMARY KEY(id,version));
-        CREATE INDEX IF NOT EXISTS wtp_transition_profiles_customer ON wtp_transition_profiles(customer_id,fund_ref,version);
-        CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_update BEFORE UPDATE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;
-        CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_delete BEFORE DELETE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;''')
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          fund_ref TEXT NOT NULL, fund_regulation TEXT NOT NULL, transition_phase TEXT NOT NULL,
+          planning TEXT NOT NULL, scope TEXT NOT NULL, decision_date TEXT, golive_date TEXT, migration_date TEXT,
+          owner TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS wtp_transition_profiles_customer ON wtp_transition_profiles(customer_id,fund_ref,version);
+          CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_update BEFORE UPDATE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_delete BEFORE DELETE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;''')
+        # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
+          # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
+        db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
+            id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, party_role TEXT NOT NULL, party_name TEXT NOT NULL,
+            task TEXT NOT NULL, input TEXT, output TEXT, handoff TEXT, dependency TEXT,
+            escalation TEXT, critical_milestone TEXT, evidence_status TEXT,
+            source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));
+            CREATE INDEX IF NOT EXISTS wtp_raci_dependencies_customer ON wtp_raci_dependencies(customer_id,fund_ref,party_role,version);
+            CREATE TRIGGER IF NOT EXISTS wtp_raci_dependencies_no_update BEFORE UPDATE ON wtp_raci_dependencies BEGIN SELECT RAISE(ABORT,'wtp raci dependencies are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS wtp_raci_dependencies_no_delete BEFORE DELETE ON wtp_raci_dependencies BEGIN SELECT RAISE(ABORT,'wtp raci dependencies are append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -1468,6 +1481,45 @@ def save_wtp_transition_profile(data):
             {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"transition_phase":data["transition_phase"]})
     with connect() as db: saved=db.execute("SELECT * FROM wtp_transition_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
 
+    return dict(saved)
+
+# WTP-002 RACI en afhankelijkheden: geldige partijrollen.
+WTP_RACI_PARTY_ROLES=("fonds","PUO","fiduciair","manager","custodian","technologiepartij")
+
+def wtp_raci_dependencies(customer_id=None, fund_ref=None, party_role=None, party_name=None):
+    with connect() as db:
+        q="SELECT * FROM wtp_raci_dependencies WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if party_role: q+=" AND party_role=?"; params.append(party_role)
+        if party_name: q+=" AND party_name=?"; params.append(party_name)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_wtp_raci_dependency(data):
+    required=("customer_id","fund_ref","party_role","party_name","task","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["party_role"] not in WTP_RACI_PARTY_ROLES: raise ValueError(f"party_role moet een van {', '.join(WTP_RACI_PARTY_ROLES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["party_role"]))))
+    pid=data.get("id") or f"wtp-raci-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k): 
+        v=data.get(k)
+        return (str(v).strip() if v is not None else None) or None
+    input_v=opt("input"); output_v=opt("output"); handoff_v=opt("handoff"); dependency_v=opt("dependency")
+    escalation_v=opt("escalation"); milestone_v=opt("critical_milestone"); evidence_v=opt("evidence_status")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM wtp_raci_dependencies WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO wtp_raci_dependencies(id,version,customer_id,fund_ref,party_role,party_name,task,input,output,handoff,dependency,escalation,critical_milestone,evidence_status,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),data["party_role"].strip(),data["party_name"].strip(),data["task"].strip(),input_v,output_v,handoff_v,dependency_v,escalation_v,milestone_v,evidence_v,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"wtp_raci_dependencies",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"party_role":data["party_role"]})
+    with connect() as db: saved=db.execute("SELECT * FROM wtp_raci_dependencies WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
