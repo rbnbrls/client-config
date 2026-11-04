@@ -99,6 +99,17 @@ class ESG001(unittest.TestCase):
             store.esg_policy_profile_in_force("northstar","SYNTHETIC-FUND-001",
                 subject_type="mandate",subject_id="SYNTHETIC-MANDATE-001",
                 valid_at="2026-03-01",known_at="2020-01-01T00:00:00Z")
+    # --- rework review t_f5af23e4: zonder fondsdekkend standaardprofiel wordt geweigerd in plaats van
+    # ander mandaatbeleid als fund_default (met bronbewijs) te presenteren
+    def test_in_force_unknown_mandate_rejected_without_fund_default(self):
+        store.save_esg_policy_profile({**MANDATE_BASE})
+        with self.assertRaises(ValueError):
+            store.esg_policy_profile_in_force("northstar","SYNTHETIC-FUND-001",
+                subject_type="mandate",subject_id="SYNTHETIC-MANDATE-NOT-REGISTERED",valid_at="2026-06-01")
+    def test_in_force_fund_query_rejected_without_fund_default(self):
+        store.save_esg_policy_profile({**MANDATE_BASE})
+        with self.assertRaises(ValueError):
+            store.esg_policy_profile_in_force("northstar","SYNTHETIC-FUND-001",valid_at="2026-06-01")
     def test_query_customer_filter(self):
         store.save_esg_policy_profile({**MANDATE_BASE})
         with store.connect() as db:
@@ -136,6 +147,8 @@ class ESG001(unittest.TestCase):
             approver="Compliance",end_date="2026-12-31",effective_from="2026-01-01"))
         self.assertEqual(e["version"],1)
         with store.connect() as db:
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute("UPDATE esg_policy_exceptions SET rationale='gewijzigd'")
             with self.assertRaises(sqlite3.IntegrityError):
                 db.execute("DELETE FROM esg_policy_exceptions")
         expired=store.esg_policy_exceptions(valid_at="2027-01-02",customer_id="northstar")

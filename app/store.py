@@ -721,15 +721,19 @@ def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref
 
 def esg_policy_profile_in_force(customer_id, fund_ref, subject_type=None, subject_id=None, valid_at=None, known_at=None):
     """Toepasselijke criteria zichtbaar en bewijsbaar bij manager onboarding en jaarlijkse review:
-    mandaatspecifiek profiel wint van het fondsdekkende standaardprofiel; bronbewijs (source_ref,
-    evidence_ref, beleidsdocumentversie) reist mee als evidence."""
+    mandaatspecifiek profiel wint van het fondsdekkende standaardprofiel; zonder eigen mandaatprofiel
+    en zonder fondsdekkend standaardprofiel wordt geweigerd (ValueError) in plaats van ander beleid
+    als fondsdekkend te presenteren; bronbewijs (source_ref, evidence_ref, beleidsdocumentversie)
+    reist mee als evidence."""
     candidates=esg_policy_profiles(valid_at=valid_at,known_at=known_at,customer_id=customer_id,fund_ref=fund_ref)
     if not candidates: raise ValueError(f"Geen geldend ESG-beleidsprofiel voor {customer_id}/{fund_ref} op valid_at={valid_at or '*'} en known_at={known_at or '*'}")
     specific=[r for r in candidates if subject_type and subject_id and r["subject_type"]==subject_type and r["subject_id"]==subject_id]
     fund_default=[r for r in candidates if not r["subject_id"]]
     if specific: item, resolved=dict(specific[0]),"mandate_specific"
     elif fund_default: item, resolved=dict(fund_default[0]),"fund_default"
-    else: item, resolved=dict(candidates[0]),"fund_default"
+    else:
+        wanted=f" voor subject {subject_type}={subject_id}" if subject_type and subject_id else ""
+        raise ValueError(f"Geen fondsdekkend standaardprofiel en geen mandaatspecifiek profiel{wanted} voor {customer_id}/{fund_ref} op valid_at={valid_at or '*'} en known_at={known_at or '*'}")
     item["resolved_from"]=resolved
     item["evidence"]={"source_ref":item["source_ref"],"evidence_ref":item["evidence_ref"],
         "policy_document_version":item["policy_document_version"],
