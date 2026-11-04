@@ -297,6 +297,7 @@ def init():
           CREATE INDEX IF NOT EXISTS esg_contractual_flowdowns_customer ON esg_contractual_flowdowns(customer_id,fund_ref,version);
           CREATE TRIGGER IF NOT EXISTS esg_contractual_flowdowns_no_update BEFORE UPDATE ON esg_contractual_flowdowns BEGIN SELECT RAISE(ABORT,'ESG contractual flowdowns are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS esg_contractual_flowdowns_no_delete BEFORE DELETE ON esg_contractual_flowdowns BEGIN SELECT RAISE(ABORT,'ESG contractual flowdowns are append-only'); END;''')
+        db.executescript("CREATE TABLE IF NOT EXISTS esg_due_diligence_dossiers(id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id), fund_ref TEXT NOT NULL, manager_ref TEXT NOT NULL, workflow_step TEXT NOT NULL, impact_priority TEXT NOT NULL DEFAULT 'medium', finding TEXT NOT NULL, human_judgement TEXT NOT NULL, action_owner TEXT NOT NULL, deadline TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(id,version)); CREATE INDEX IF NOT EXISTS esg_due_diligence_dossiers_customer ON esg_due_diligence_dossiers(customer_id,fund_ref,version); CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_update BEFORE UPDATE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END; CREATE TRIGGER IF NOT EXISTS esg_due_diligence_dossiers_no_delete BEFORE DELETE ON esg_due_diligence_dossiers BEGIN SELECT RAISE(ABORT,'ESG due diligence dossiers are append-only'); END;")
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -733,6 +734,8 @@ ESG_POLICY_IMPACT_FIELDS=("policy_framework","goals","priority","asset_class_sco
 ESG_MANAGER_SELECTION_STAGES=("onboarding","annual_review","retention_review")
 ESG_FLOWDOWN_CLAUSES=("oecd_ungp","due_diligence","cooperation","reporting","incident_reporting","data_position_insight","remediation","escalation")
 ESG_FLOWDOWN_TARGETS=("direct_manager","sub_manager")
+ESG_DD_WORKFLOW_STEPS=("policy_systems","impact_identification","prevention_mitigation","monitoring_results","communication","remediation")
+ESG_DD_IMPACT_PRIORITIES=("high","medium","low")
 
 def esg_policy_profiles(valid_at=None, known_at=None, customer_id=None, fund_ref=None):
     """Laatste versie per profiel; met valid_at alleen profielen geldend op die datum (zoals governance_policies)."""
@@ -1015,6 +1018,48 @@ def esg_contractual_flowdowns(customer_id=None, fund_ref=None, manager_ref=None,
     if valid_at:
         for r in result:
             r["validity_status"]="active" if (r.get("exception_end_date") is None or r["exception_end_date"]>=valid_at) else "expired"
+    return result
+
+def save_esg_due_diligence_dossier(data):
+    required=("customer_id","fund_ref","manager_ref","workflow_step","finding","human_judgement","action_owner","deadline","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    step=data["workflow_step"].strip()
+    if step not in ESG_DD_WORKFLOW_STEPS: raise ValueError(f"workflow_step moet een van {', '.join(ESG_DD_WORKFLOW_STEPS)} zijn")
+    priority=(data.get("impact_priority") or "medium").strip()
+    if priority not in ESG_DD_IMPACT_PRIORITIES: raise ValueError(f"impact_priority moet een van {', '.join(ESG_DD_IMPACT_PRIORITIES)} zijn")
+    dl=data["deadline"].strip()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",dl): raise ValueError("deadline moet ISO YYYY-MM-DD")
+    date.fromisoformat(dl)
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["manager_ref"]),step)))
+    pid=data.get("id") or f"esgdd-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM esg_due_diligence_dossiers WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO esg_due_diligence_dossiers(id,version,customer_id,fund_ref,manager_ref,workflow_step,impact_priority,finding,human_judgement,action_owner,deadline,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["fund_ref"]).strip(),str(data["manager_ref"]).strip(),step,priority,
+           data["finding"].strip(),data["human_judgement"].strip(),data["action_owner"].strip(),dl,
+           data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"esg_due_diligence_dossier",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"manager_ref":data["manager_ref"],"workflow_step":step,"impact_priority":priority,"deadline":dl,"source_ref":data["source_ref"].strip()})
+    with connect() as db: saved=db.execute("SELECT * FROM esg_due_diligence_dossiers WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def esg_due_diligence_dossiers(customer_id=None, fund_ref=None, manager_ref=None, workflow_step=None, valid_at=None):
+    with connect() as db:
+        q="SELECT * FROM esg_due_diligence_dossiers WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        if workflow_step: q+=" AND workflow_step=?"; params.append(workflow_step)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    result=[dict(r) for r in rows]
+    if valid_at:
+        for r in result:
+            r["validity_status"]="active" if r["deadline"]>=valid_at else "overdue"
     return result
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
