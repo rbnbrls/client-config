@@ -1,0 +1,6 @@
+# sync-main-to-github
+timestamp: 2026-11-04T21:04:49Z
+repo:      /Users/ruben/Code/client-config
+base:      main
+sync-main: worktree is dirty — commit or stash before publishing (/Users/ruben/Code/client-config) 3
+evidence: /Users/ruben/Code/client-config/.hermes/team/evidence/20261104T210449Z-github-sync-main.log

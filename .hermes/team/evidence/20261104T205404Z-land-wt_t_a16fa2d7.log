@@ -1,0 +1,10 @@
+# land-feature
+timestamp:       2026-11-04T20:54:04Z
+branch:          wt/t_a16fa2d7
+feature_sha:     b923c98
+main_sha_before: c96dccf059bdb98b5f7b83422629e3fbcf6cabd3
+merge_sha:       54f6471
+base:            main
+worktree:        /Users/ruben/Code/client-config/.worktrees/t_a16fa2d7
+acceptance_url:  http://localhost:8080
+verified:        gate green in worktree and on main after merge

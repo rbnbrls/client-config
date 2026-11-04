@@ -1,0 +1,10 @@
+# land-feature
+timestamp:       2026-11-04T20:52:52Z
+branch:          feat/t_03ef9ca0-fee-004-manager-look-through
+feature_sha:     f32aee3
+main_sha_before: 39a0acede4094db1bb56e92351d194c804a2152a
+merge_sha:       c96dccf
+base:            main
+worktree:        /Users/ruben/Code/client-config/.worktrees/t_03ef9ca0
+acceptance_url:  http://localhost:8080
+verified:        gate green in worktree and on main after merge
