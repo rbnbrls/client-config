@@ -125,6 +125,16 @@ def init():
           CREATE INDEX IF NOT EXISTS graph_knowledge_asof ON graph_knowledge_snapshots(customer_id,recorded_at,revision);
           CREATE TRIGGER IF NOT EXISTS graph_knowledge_no_update BEFORE UPDATE ON graph_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'graph knowledge snapshots are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS graph_knowledge_no_delete BEFORE DELETE ON graph_knowledge_snapshots BEGIN SELECT RAISE(ABORT,'graph knowledge snapshots are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS document_references(
+          id TEXT NOT NULL, version INTEGER NOT NULL,
+          subject_type TEXT NOT NULL, subject_id TEXT NOT NULL, subject_version INTEGER NOT NULL,
+          document_type TEXT NOT NULL, document_date TEXT NOT NULL, owner TEXT NOT NULL,
+          confidentiality TEXT NOT NULL, retention_class TEXT NOT NULL, storage_ref TEXT NOT NULL,
+          rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS document_reference_subject ON document_references(subject_type,subject_id,subject_version);
+          CREATE TRIGGER IF NOT EXISTS document_reference_no_update BEFORE UPDATE ON document_references BEGIN SELECT RAISE(ABORT,'document references are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS document_reference_no_delete BEFORE DELETE ON document_references BEGIN SELECT RAISE(ABORT,'document references are append-only'); END;''')
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -789,3 +799,48 @@ def client_variant_signals(control_code=None):
         if status!="validated":
             result.append({"variant_id":v["id"],"control_code":v["control_code"],"signal":"policy_not_validated","blocking":False})
     return result
+
+# DOC-001: versiegebonden bewijsreferenties — documentmetadata, geen bestandsinhoud.
+DOCUMENT_TYPES={"contract","policy","isms_certificate","assessment_report","minutes","other"}
+CONFIDENTIALITY_CLASSES={"open","intern","vertrouwelijk","geheim"}
+RETENTION_CLASSES={"default_7y","default_10y","permanent","custom"}
+
+def document_references(subject_type=None, subject_id=None, subject_version=None):
+    query="SELECT d.* FROM document_references d JOIN (SELECT id,MAX(version) version FROM document_references GROUP BY id) latest ON d.id=latest.id AND d.version=latest.version"
+    clauses=[]; args=[]
+    if subject_type: clauses.append("d.subject_type=?"); args.append(subject_type)
+    if subject_id: clauses.append("d.subject_id=?"); args.append(subject_id)
+    if subject_version is not None:
+        clauses.append("d.subject_version=?"); args.append(subject_version)
+    if clauses: query+=" WHERE "+" AND ".join(clauses)
+    query+=" ORDER BY d.created_at DESC"
+    with connect() as db: rows=db.execute(query,args).fetchall()
+    return [dict(row) for row in rows]
+
+def save_document_reference(data):
+    unknown={"content","file_path","blob"} & {k for k in data if data.get(k)}
+    if unknown: raise ValueError("Documentinhoud wordt niet opgeslagen; alleen referenties (DOC-001: geen contractbestand of klantgegeven in git)")
+    required=("subject_type","subject_id","subject_version","document_type","document_date","owner","confidentiality","retention_class","storage_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if data["document_type"] not in DOCUMENT_TYPES: raise ValueError("Ongeldig documenttype")
+    if data["confidentiality"] not in CONFIDENTIALITY_CLASSES: raise ValueError("Ongeldige vertrouwelijkheidsklasse")
+    if data["retention_class"] not in RETENTION_CLASSES: raise ValueError("Ongeldige retentieklasse")
+    try:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}",data["document_date"]): raise ValueError
+        date.fromisoformat(data["document_date"])
+    except ValueError: raise ValueError("Documentdatum moet ISO YYYY-MM-DD zijn")
+    subject_version=data["subject_version"]
+    if isinstance(subject_version,bool) or not isinstance(subject_version,int) or subject_version<1: raise ValueError("subject_version moet een positief geheel getal zijn")
+    storage_ref=data["storage_ref"].strip()
+    scheme=storage_ref.split("://",1)[0].lower() if "://" in storage_ref else ""
+    if scheme not in {"dms","s3","https","azblob","gs"}: raise ValueError("storage_ref moet een externe opslagreferentie zijn (bijv. dms://, s3://, https://); lokale bestanden en inhoud worden niet bewaard")
+    # Identiteit is de (subject, documenttype)-binding; revisies vormen append-only versies van dezelfde referentie.
+    ref_id=data.get("id") or "docref-"+re.sub(r"[^a-z0-9]+","-",f"{data['subject_type'].strip()}-{data['subject_id'].strip()}-{data['document_type']}".lower()).strip("-")
+    actor=data.get("actor","demo.compliance").strip(); stamp=now()
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM document_references WHERE id=?",(ref_id,)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("INSERT INTO document_references(id,version,subject_type,subject_id,subject_version,document_type,document_date,owner,confidentiality,retention_class,storage_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(ref_id,version,data["subject_type"].strip(),data["subject_id"].strip(),subject_version,data["document_type"],data["document_date"],data["owner"].strip(),data["confidentiality"],data["retention_class"],storage_ref,data["rationale"].strip(),actor,stamp))
+        audit(db,"document_reference",ref_id,"created" if version==1 else "versioned",actor,data["rationale"],{"version":version,"subject_type":data["subject_type"],"subject_id":data["subject_id"],"subject_version":subject_version,"document_type":data["document_type"],"document_date":data["document_date"],"owner":data["owner"],"confidentiality":data["confidentiality"],"retention_class":data["retention_class"],"storage_ref":storage_ref})
+    return next(r for r in document_references(subject_id=data["subject_id"]) if r["id"]==ref_id)
