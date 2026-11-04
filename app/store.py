@@ -494,6 +494,19 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS cost_overview_customer ON cost_overview(customer_id,fund_ref,cost_type,version);
             CREATE TRIGGER IF NOT EXISTS cost_overview_no_update BEFORE UPDATE ON cost_overview BEGIN SELECT RAISE(ABORT,'cost overview is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS cost_overview_no_delete BEFORE DELETE ON cost_overview BEGIN SELECT RAISE(ABORT,'cost overview is append-only'); END;''')
+        # TWIN-001 Change-as-code
+        db.executescript('''CREATE TABLE IF NOT EXISTS change_as_code(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            entity_type TEXT NOT NULL, entity_ref TEXT NOT NULL,
+            base_version TEXT NOT NULL, effective_from TEXT NOT NULL,
+            diff TEXT NOT NULL, rationale TEXT NOT NULL, evidence_ref TEXT NOT NULL,
+            schema_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+            source_ref TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS change_as_code_customer ON change_as_code(customer_id,entity_type,entity_ref,version);
+            CREATE TRIGGER IF NOT EXISTS change_as_code_no_update BEFORE UPDATE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS change_as_code_no_delete BEFORE DELETE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -2789,3 +2802,46 @@ def save_notification_signal(data):
     with connect() as db:
         saved = db.execute("SELECT * FROM notification_signals WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1", (mid, cid)).fetchone()
     return dict(saved)
+
+
+CHANGE_AS_CODE_REQUIRED = ("customer_id", "entity_type", "entity_ref", "base_version", "effective_from", "diff", "rationale", "evidence_ref", "schema_version", "policy_version", "source_ref")
+
+def save_change_as_code(data):
+    for key in CHANGE_AS_CODE_REQUIRED:
+        if data.get(key) is None or not str(data[key]).strip():
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]):
+        raise ValueError("Klant niet gevonden")
+    slug = "-".join((re.sub(r"[^a-z0-9]+", "-", s).strip("-") for s in (str(data["customer_id"]), str(data["entity_type"]), str(data["entity_ref"]), str(data["base_version"]))))
+    pid = data.get("id") or f"change-{slug}"
+    actor = data.get("actor", "demo.client-service")
+    actor = actor.strip() if str(actor).strip() else "demo.client-service"
+    stamp = now()
+    cid = data["customer_id"]
+    with connect() as db:
+        previous = db.execute("SELECT MAX(version) version FROM change_as_code WHERE id=? AND customer_id=?", (pid, cid)).fetchone()["version"]
+        version = (previous or 0) + 1
+        db.execute("""INSERT INTO change_as_code(id,version,customer_id,entity_type,entity_ref,base_version,effective_from,diff,rationale,evidence_ref,schema_version,policy_version,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid, version, cid, data["entity_type"].strip(), data["entity_ref"].strip(), data["base_version"].strip(), data["effective_from"].strip(), str(data["diff"]).strip(), data["rationale"].strip(), data["evidence_ref"].strip(), data["schema_version"].strip(), data["policy_version"].strip(), data["source_ref"].strip(), actor, stamp))
+        audit(db, "change_as_code", pid, "created" if version == 1 else "versioned", actor, data["rationale"].strip(), {"customer_id": cid, "version": version, "entity_type": data["entity_type"]})
+    with connect() as db:
+        saved = db.execute("SELECT * FROM change_as_code WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1", (pid, cid)).fetchone()
+    return dict(saved)
+
+def change_as_code(customer_id=None, entity_type=None, entity_ref=None):
+    with connect() as db:
+        q = "SELECT * FROM change_as_code WHERE 1=1"; params = []
+        if customer_id: q += " AND customer_id=?"; params.append(customer_id)
+        if entity_type: q += " AND entity_type=?"; params.append(entity_type)
+        if entity_ref: q += " AND entity_ref=?"; params.append(entity_ref)
+        rows = db.execute(q + " ORDER BY created_at DESC", params).fetchall()
+    return [dict(r) for r in rows]
+
+def change_as_code_export(customer_id=None, entity_type=None, entity_ref=None):
+    rows = change_as_code(customer_id=customer_id, entity_type=entity_type, entity_ref=entity_ref)
+    return {"generated_at": now(), "perimeter": {"customer_id": customer_id, "entity_type": entity_type, "entity_ref": entity_ref}, "coverage": len(rows), "rows": rows}
+
+# aliases
+save_change_as_codes = save_change_as_code
+change_as_codes = change_as_code
+change_as_codes_export = change_as_code_export
