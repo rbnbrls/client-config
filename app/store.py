@@ -467,6 +467,19 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS manager_look_through_customer ON manager_look_through(customer_id,manager_ref,fund_ref,version);
             CREATE TRIGGER IF NOT EXISTS manager_look_through_no_update BEFORE UPDATE ON manager_look_through BEGIN SELECT RAISE(ABORT,'manager look-through is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS manager_look_through_no_delete BEFORE DELETE ON manager_look_through BEGIN SELECT RAISE(ABORT,'manager look-through is append-only'); END;''')
+        # FEE-005 Simulatie
+        db.executescript('''CREATE TABLE IF NOT EXISTS fee_simulation(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, manager_ref TEXT, product_ref TEXT,
+            scenario_name TEXT NOT NULL, level TEXT NOT NULL,
+            baseline_amount REAL, scenario_amount REAL, delta_amount REAL,
+            missing_inputs TEXT, uncertainty TEXT, source_ref TEXT NOT NULL,
+            rationale TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS fee_simulation_customer ON fee_simulation(customer_id,fund_ref,level,version);
+            CREATE TRIGGER IF NOT EXISTS fee_simulation_no_update BEFORE UPDATE ON fee_simulation BEGIN SELECT RAISE(ABORT,'fee simulation is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS fee_simulation_no_delete BEFORE DELETE ON fee_simulation BEGIN SELECT RAISE(ABORT,'fee simulation is append-only'); END;''')
         # FEE-003 Kostenoverzicht
         db.executescript('''CREATE TABLE IF NOT EXISTS cost_overview(
             id TEXT NOT NULL, version INTEGER NOT NULL,
@@ -1918,6 +1931,53 @@ def manager_look_through_export(customer_id=None, manager_ref=None, fund_ref=Non
     rows=manager_look_through(customer_id=customer_id,manager_ref=manager_ref,fund_ref=fund_ref)
     return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"manager_ref":manager_ref,"fund_ref":fund_ref},"coverage":len(rows),"rows":rows}
 
+
+FEE_SIMULATION_LEVELS=("manager","product","customer","total")
+
+def save_fee_simulation(data):
+    required=("customer_id","fund_ref","scenario_name","level","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["level"] not in FEE_SIMULATION_LEVELS: raise ValueError(f"level moet een van {', '.join(FEE_SIMULATION_LEVELS)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["scenario_name"]),str(data["level"]))))
+    pid=data.get("id") or f"feesim-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k); return (str(v).strip() if v is not None else None) or None
+    def optf(k):
+        v=data.get(k)
+        if v is None or v=="": return None
+        return float(v)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM fee_simulation WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO fee_simulation(id,version,customer_id,fund_ref,manager_ref,product_ref,scenario_name,level,baseline_amount,scenario_amount,delta_amount,missing_inputs,uncertainty,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),opt("manager_ref"),opt("product_ref"),data["scenario_name"].strip(),data["level"].strip(),optf("baseline_amount"),optf("scenario_amount"),optf("delta_amount"),opt("missing_inputs"),opt("uncertainty"),data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"fee_simulation",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),{"customer_id":cid,"version":version,"level":data["level"]})
+    with connect() as db: saved=db.execute("SELECT * FROM fee_simulation WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def fee_simulation(customer_id=None, fund_ref=None, level=None, manager_ref=None, product_ref=None):
+    with connect() as db:
+        q="SELECT * FROM fee_simulation WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if level: q+=" AND level=?"; params.append(level)
+        if manager_ref: q+=" AND manager_ref=?"; params.append(manager_ref)
+        if product_ref: q+=" AND product_ref=?"; params.append(product_ref)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def fee_simulation_export(customer_id=None, fund_ref=None, level=None):
+    rows=fee_simulation(customer_id=customer_id,fund_ref=fund_ref,level=level)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"fund_ref":fund_ref,"level":level},"coverage":len(rows),"rows":rows}
+
+# aliases
+save_fee_simulations=save_fee_simulation
+fee_simulations=fee_simulation
+fee_simulations_export=fee_simulation_export
 
 def fee_components_export(customer_id=None, fund_ref=None):
     rows=fee_components(customer_id=customer_id,fund_ref=fund_ref)
