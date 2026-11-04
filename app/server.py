@@ -62,6 +62,29 @@ class Handler(BaseHTTPRequestHandler):
                 history=store.graph_knowledge_history(register_history.group(1))
                 return self.send_json(history) if history else self.send_json({"error":"not_found"},404)
             if path=="/api/dora-assessments":return self.send_json(store.dora_assessments())
+            if path=="/api/chain-parties":return self.send_json(store.chain_parties(customer_id=q.get("customer_id",[None])[0]))
+            if path=="/api/v1/chain-parties":
+                valid_at=q.get("valid_at",[None])[0]; known_at=q.get("known_at",[None])[0]
+                if not valid_at or not known_at:return self.send_json({"error":"valid_at en known_at zijn verplicht"},400)
+                try: date.fromisoformat(valid_at); store._utc_stamp(known_at)
+                except ValueError:return self.send_json({"error":"Ongeldig datum- of tijdformaat"},400)
+                cid=q.get("customer_id",[None])[0]
+                if not cid:return self.send_json({"error":"customer_id is verplicht"},400)
+                return self.send_json(store.chain_parties(customer_id=cid,valid_at=valid_at,known_at=known_at))
+            chain_trace=re.fullmatch(r"/api/customers/([\w-]+)/chain-trace/([\w-]+)",path)
+            if chain_trace:
+                try: trace=store.chain_trace(customer_id=chain_trace.group(1),party_id=chain_trace.group(2),valid_at=q.get("valid_at",[None])[0],known_at=q.get("known_at",[None])[0])
+                except ValueError as e: return self.send_json({"error":str(e)},404)
+                return self.send_json(trace)
+            chain_impact=re.fullmatch(r"/api/customers/([\w-]+)/chain-impact/([\w-]+)",path)
+            if chain_impact:
+                try: impact=store.chain_impact(customer_id=chain_impact.group(1),party_id=chain_impact.group(2),valid_at=q.get("valid_at",[None])[0],known_at=q.get("known_at",[None])[0])
+                except ValueError as e: return self.send_json({"error":str(e)},404)
+                return self.send_json(impact)
+            if path=="/api/chain-tasks":
+                cid=q.get("customer_id",[None])[0]
+                if not cid:return self.send_json({"error":"customer_id is verplicht"},400)
+                return self.send_json(store.chain_tasks(cid,party_id=q.get("party_id",[None])[0]))
             if path=="/api/activities":return self.send_json(store.activities(customer_id=q.get("customer_id",[None])[0]))
             if path=="/api/v1/activities":
                 valid_at=q.get("valid_at",[None])[0]; known_at=q.get("known_at",[None])[0]
@@ -138,6 +161,16 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/dora-assessments":return self.send_json(store.save_dora_assessment(data),201)
             if path=="/api/activities":
                 try: return self.send_json(store.save_activity(data),201)
+                except ValueError as e: return self.send_json({"error":str(e)},400)
+            if path=="/api/chain-parties":
+                try: return self.send_json(store.save_chain_party(data),201)
+                except ValueError as e: return self.send_json({"error":str(e)},400)
+            if path=="/api/chain-tasks":
+                try: return self.send_json(store.save_chain_task(data),201)
+                except ValueError as e: return self.send_json({"error":str(e)},400)
+            chain_complete=re.fullmatch(r"/api/chain-tasks/([\w-]+)/complete",path)
+            if chain_complete:
+                try: return self.send_json(store.complete_chain_task(task_id=chain_complete.group(1),customer_id=data.get("customer_id"),evidence=data.get("completion_evidence"),actor=data.get("actor")),201)
                 except ValueError as e: return self.send_json({"error":str(e)},400)
             if path=="/api/client-entities":return self.send_json(store.save_client_entity(data),201)
             if path=="/api/client-relationships":return self.send_json(store.save_client_relationship(data),201)
