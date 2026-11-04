@@ -364,6 +364,19 @@ def init():
           CREATE INDEX IF NOT EXISTS transparency_outputs_customer ON transparency_outputs(customer_id,disclosure_ref,version);
           CREATE TRIGGER IF NOT EXISTS transparency_outputs_no_update BEFORE UPDATE ON transparency_outputs BEGIN SELECT RAISE(ABORT,'transparency outputs are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS transparency_outputs_no_delete BEFORE DELETE ON transparency_outputs BEGIN SELECT RAISE(ABORT,'transparency outputs are append-only'); END;''')
+        # WTP-001 Transitieprofiel: fondsregeling/transitiefase, planning, scope, relevante
+        # besluit-/go-live-/invaardata en eigenaar. Append-only versieer per fonds.
+        db.executescript('''CREATE TABLE IF NOT EXISTS wtp_transition_profiles(
+        id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+        fund_ref TEXT NOT NULL, fund_regulation TEXT NOT NULL, transition_phase TEXT NOT NULL,
+        planning TEXT NOT NULL, scope TEXT NOT NULL, decision_date TEXT, golive_date TEXT, migration_date TEXT,
+        owner TEXT NOT NULL, source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+        created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY(id,version));
+        CREATE INDEX IF NOT EXISTS wtp_transition_profiles_customer ON wtp_transition_profiles(customer_id,fund_ref,version);
+        CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_update BEFORE UPDATE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_delete BEFORE DELETE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;''')
+
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
         if "effective_to" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_to TEXT")
@@ -1418,6 +1431,43 @@ def save_transparency_output(data):
         audit(db,"transparency_outputs",toid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"disclosure_ref":data["disclosure_ref"],"publication_consent":consent})
     with connect() as db: saved=db.execute("SELECT * FROM transparency_outputs WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(toid,cid)).fetchone()
+    return dict(saved)
+
+# WTP-001 transitieprofiel: geldige waarden voor de transitiefase.
+WTP_TRANSITION_PHASES=("preparation","decision","migration","golive","aftercare","closed")
+
+def wtp_transition_profiles(customer_id=None, fund_ref=None, transition_phase=None, owner=None):
+    with connect() as db:
+        q="SELECT * FROM wtp_transition_profiles WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if transition_phase: q+=" AND transition_phase=?"; params.append(transition_phase)
+        if owner: q+=" AND owner=?"; params.append(owner)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_wtp_transition_profile(data):
+    required=("customer_id","fund_ref","fund_regulation","transition_phase","planning","scope","owner","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data["transition_phase"] not in WTP_TRANSITION_PHASES: raise ValueError(f"transition_phase moet een van {', '.join(WTP_TRANSITION_PHASES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]))))
+    pid=data.get("id") or f"wtp-{slug}"
+    actor=data.get("actor","demo.client-service").strip(); stamp=now(); cid=data["customer_id"]
+    decision_date=(data.get("decision_date") or "").strip() or None
+    golive_date=(data.get("golive_date") or "").strip() or None
+    migration_date=(data.get("migration_date") or "").strip() or None
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM wtp_transition_profiles WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO wtp_transition_profiles(id,version,customer_id,fund_ref,fund_regulation,transition_phase,planning,scope,decision_date,golive_date,migration_date,owner,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),data["fund_regulation"].strip(),data["transition_phase"].strip(),data["planning"].strip(),data["scope"].strip(),decision_date,golive_date,migration_date,data["owner"].strip(),data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"wtp_transition_profiles",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"transition_phase":data["transition_phase"]})
+    with connect() as db: saved=db.execute("SELECT * FROM wtp_transition_profiles WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
