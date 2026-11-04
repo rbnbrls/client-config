@@ -402,6 +402,18 @@ def init():
             CREATE INDEX IF NOT EXISTS wtp_transition_data_customer ON wtp_transition_data(customer_id,fund_ref,data_phase,version);
             CREATE TRIGGER IF NOT EXISTS wtp_transition_data_no_update BEFORE UPDATE ON wtp_transition_data BEGIN SELECT RAISE(ABORT,'wtp transition data are append-only'); END;
             CREATE TRIGGER IF NOT EXISTS wtp_transition_data_no_delete BEFORE DELETE ON wtp_transition_data BEGIN SELECT RAISE(ABORT,'wtp transition data are append-only'); END;''')
+        # WTP-004 Mijlpalen en gereedheidscriteria
+        db.executescript('''CREATE TABLE IF NOT EXISTS wtp_milestones(
+            id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+            fund_ref TEXT NOT NULL, deliverable TEXT NOT NULL, planning TEXT,
+            validation_criteria TEXT NOT NULL, progress_report TEXT, risk_impact TEXT,
+            recovery_plan TEXT, go_no_go_evidence TEXT, evidence_status TEXT,
+            source_ref TEXT NOT NULL, rationale TEXT NOT NULL,
+            created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));
+            CREATE INDEX IF NOT EXISTS wtp_milestones_customer ON wtp_milestones(customer_id,fund_ref,deliverable,version);
+            CREATE TRIGGER IF NOT EXISTS wtp_milestones_no_update BEFORE UPDATE ON wtp_milestones BEGIN SELECT RAISE(ABORT,'wtp milestones are append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS wtp_milestones_no_delete BEFORE DELETE ON wtp_milestones BEGIN SELECT RAISE(ABORT,'wtp milestones are append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -1569,6 +1581,46 @@ def save_wtp_transition_data(data):
         audit(db,"wtp_transition_data",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
             {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"data_phase":data["data_phase"]})
     with connect() as db: saved=db.execute("SELECT * FROM wtp_transition_data WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+# WTP-004 Mijlpalen en gereedheidscriteria: geldige bewijsstatussen.
+WTP_MILESTONE_EVIDENCE_STATUSES=("open","in_progress","validated","go","no_go")
+
+def wtp_milestones(customer_id=None, fund_ref=None, deliverable=None, evidence_status=None):
+    with connect() as db:
+        q="SELECT * FROM wtp_milestones WHERE 1=1"
+        params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if fund_ref: q+=" AND fund_ref=?"; params.append(fund_ref)
+        if deliverable: q+=" AND deliverable=?"; params.append(deliverable)
+        if evidence_status: q+=" AND evidence_status=?"; params.append(evidence_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def save_wtp_milestone(data):
+    required=("customer_id","fund_ref","deliverable","validation_criteria","source_ref","rationale")
+    for key in required:
+        if data.get(key) is None or not str(data[key]).strip(): raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    if data.get("evidence_status") not in (None,"") and data["evidence_status"] not in WTP_MILESTONE_EVIDENCE_STATUSES:
+        raise ValueError(f"evidence_status moet een van {', '.join(WTP_MILESTONE_EVIDENCE_STATUSES)} zijn")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",s).strip("-") for s in (str(data["customer_id"]),str(data["fund_ref"]),str(data["deliverable"]))))
+    pid=data.get("id") or f"wtp-ms-{slug}"
+    actor=data.get("actor","demo.client-service").strip() if str(data.get("actor","demo.client-service")).strip() else "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    def opt(k):
+        v=data.get(k)
+        return (str(v).strip() if v is not None else None) or None
+    planning_v=opt("planning"); progress_v=opt("progress_report"); risk_v=opt("risk_impact")
+    recovery_v=opt("recovery_plan"); gonogo_v=opt("go_no_go_evidence"); status_v=opt("evidence_status")
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM wtp_milestones WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO wtp_milestones(id,version,customer_id,fund_ref,deliverable,planning,validation_criteria,progress_report,risk_impact,recovery_plan,go_no_go_evidence,evidence_status,source_ref,rationale,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,data["fund_ref"].strip(),data["deliverable"].strip(),planning_v,data["validation_criteria"].strip(),progress_v,risk_v,recovery_v,gonogo_v,status_v,data["source_ref"].strip(),data["rationale"].strip(),actor,stamp))
+        audit(db,"wtp_milestones",pid,"created" if version==1 else "versioned",actor,data["rationale"].strip(),
+            {"customer_id":cid,"version":version,"fund_ref":data["fund_ref"],"deliverable":data["deliverable"]})
+    with connect() as db: saved=db.execute("SELECT * FROM wtp_milestones WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
     return dict(saved)
 
 def snapshot_graph_knowledge(db, customer_id, actor, reason, stamp=None):
