@@ -1,0 +1,32 @@
+# local-gate
+timestamp: 20261105T050827Z
+worktree:  /Users/ruben/Code/client-config
+branch:    main
+head:      35ea7bd
+host:      rubens-MacBook-Pro.local
+
+trace_id:       gate-20261105T050827Z-6115cb53
+correlation_id: gate-20261105T050827Z-6115cb53
+
+project:       client-config
+build_recipe:  /opt/homebrew/bin/python3.13 -m pytest -q stack=none
+
+## step: test
+$ sh -c /opt/homebrew/bin/python3.13 -m pytest -q
+........................................................................ [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 58%]
+........................................................................ [ 77%]
+........................................................................ [ 97%]
+..........                                                               [100%]
+370 passed in 29.32s
+RESULT test PASS
+## step: diff-check
+$ git diff --check HEAD
+RESULT diff-check PASS
+
+## summary
+- test:PASS
+- diff-check:PASS
+overall: PASS
+log: /Users/ruben/Code/client-config/.hermes/team/evidence/20261105T050827Z-local-gate-main.log

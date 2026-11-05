@@ -1,0 +1,26 @@
+# sync-main-to-github
+timestamp: 2026-11-05T05:08:26Z
+repo:      /Users/ruben/Code/client-config
+base:      main
+fetch:  origin
+local  main: 35ea7bd
+origin main: f19ed50
+divergence:  ahead=2 behind=0
+pending: 2 local commit(s) not on GitHub
+gate:   running local build on main
+local-gate: main @ 35ea7bd in /Users/ruben/Code/client-config
+local-gate: project client-config (stack=none serve=cmd)
+  -> test
+     PASS test
+  -> diff-check
+     PASS diff-check
+
+local-gate: GREEN — main @ 35ea7bd
+evidence: /Users/ruben/Code/client-config/.hermes/team/evidence/20261105T050827Z-local-gate-main.log
+gate:   GREEN (/Users/ruben/Code/client-config/.hermes/team/evidence/20261105T050827Z-local-gate-main.log)
+To https://github.com/rbnbrls/client-config
+   f19ed50..35ea7bd  main -> main
+verify: reading origin/main back
+verify: origin/main == 35ea7bd — confirmed on GitHub
+evidence: /Users/ruben/Code/client-config/.hermes/team/evidence/20261105T050826Z-github-sync-main.log
+result: PUBLISHED 35ea7bd to origin/main
