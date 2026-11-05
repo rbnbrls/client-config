@@ -442,7 +442,8 @@ def init():
           id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
           name TEXT, benchmark_type TEXT, index_id TEXT, provider TEXT, return_type TEXT NOT NULL,
           currency TEXT, hedge_status TEXT, components TEXT, weights TEXT, rebalance_frequency TEXT,
-          valid_from TEXT, valid_to TEXT, actor TEXT NOT NULL, source_ref TEXT NOT NULL,
+          valid_from TEXT, valid_to TEXT, effective_date TEXT, history_policy TEXT,
+          known_at TEXT, actor TEXT NOT NULL, source_ref TEXT NOT NULL,
           created_by TEXT, created_at TEXT NOT NULL, PRIMARY KEY(id,version));
           CREATE INDEX IF NOT EXISTS benchmark_versions_customer ON benchmark_versions(customer_id,version);
           CREATE TRIGGER IF NOT EXISTS benchmark_versions_no_update BEFORE UPDATE ON benchmark_versions BEGIN SELECT RAISE(ABORT,'benchmarks are append-only'); END;
@@ -3298,6 +3299,7 @@ def pension_portfolio_export(customer_id=None, mandate=None):
 
 integration_export=integration_export
 BENCHMARK_REQUIRED=["customer_id","return_type","actor","source_ref"]
+HISTORY_POLICIES={"revise","link"}
 RETURN_TYPES={"total","net","price"}
 REBALANCE_FREQUENCIES={"daily","monthly","quarterly","buy-and-hold"}
 
@@ -3326,7 +3328,20 @@ def save_benchmark(data):
         previous=db.execute("SELECT MAX(version) version FROM benchmark_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
         version=(previous or 0)+1
         stamp=now()
-        db.execute("""INSERT INTO benchmark_versions(id,version,customer_id,name,benchmark_type,index_id,provider,return_type,currency,hedge_status,components,weights,rebalance_frequency,valid_from,valid_to,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        HISTORY_POLICIES={"revise","link"}
+        hp=data.get("history_policy")
+        if hp is not None and str(hp).strip()!="" and str(hp).strip() not in HISTORY_POLICIES:
+            raise ValueError("invalid history_policy")
+        hp_val=(str(hp).strip() if hp is not None and str(hp).strip()!="" else "link")
+        eff=data.get("effective_date")
+        eff_val=(eff.strip() if isinstance(eff,str) and str(eff).strip()!="" else (data.get("valid_from").strip() if isinstance(data.get("valid_from"),str) else data.get("valid_from"))) if eff is None else (eff.strip() if isinstance(eff,str) else eff)
+        if eff_val is None or (isinstance(eff_val,str) and eff_val==""):
+            eff_val=None
+        known=data.get("known_at")
+        known_val=(known.strip() if isinstance(known,str) and str(known).strip()!="" else None) if known is not None else None
+        if known_val is None:
+            known_val=stamp
+        db.execute("""INSERT INTO benchmark_versions(id,version,customer_id,name,benchmark_type,index_id,provider,return_type,currency,hedge_status,components,weights,rebalance_frequency,valid_from,valid_to,effective_date,history_policy,known_at,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (pid,version,cid,name,
              (data.get("benchmark_type") or "").strip() or None,
              (data.get("index_id") or "").strip() or None if isinstance(data.get("index_id"),str) else data.get("index_id"),
@@ -3338,6 +3353,7 @@ def save_benchmark(data):
              (str(rf).strip() if rf is not None and str(rf).strip()!="" else None),
              (data.get("valid_from") or "").strip() or None if isinstance(data.get("valid_from"),str) else data.get("valid_from"),
              (data.get("valid_to") or "").strip() or None if isinstance(data.get("valid_to"),str) else data.get("valid_to"),
+             eff_val, hp_val, known_val,
              str(data["actor"]).strip(),str(data["source_ref"]).strip(),data.get("created_by"),stamp))
         audit(db,"benchmark",pid,"created" if version==1 else "versioned",str(data["actor"]).strip(),"benchmark",{"customer_id":cid,"version":version,"return_type":rt})
     with connect() as db: saved=db.execute("SELECT * FROM benchmark_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
@@ -3354,7 +3370,7 @@ def benchmarks(customer_id=None, return_type=None, index_id=None):
 
 def benchmark_export(customer_id=None):
     rows=benchmarks(customer_id=customer_id)
-    return [{"id":r["id"],"version":r["version"],"index_id":r["index_id"],"provider":r["provider"],"return_type":r["return_type"],"currency":r["currency"],"hedge_status":r["hedge_status"],"rebalance_frequency":r["rebalance_frequency"],"valid_from":r["valid_from"],"valid_to":r["valid_to"],"created_at":r["created_at"]} for r in rows]
+    return [{"id":r["id"],"version":r["version"],"index_id":r["index_id"],"provider":r["provider"],"return_type":r["return_type"],"currency":r["currency"],"hedge_status":r["hedge_status"],"rebalance_frequency":r["rebalance_frequency"],"valid_from":r["valid_from"],"valid_to":r["valid_to"],"effective_date":r["effective_date"],"history_policy":r["history_policy"],"known_at":r["known_at"],"created_at":r["created_at"]} for r in rows]
 
 save_benchmark=save_benchmark
 benchmark=benchmarks
