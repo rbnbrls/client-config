@@ -436,6 +436,17 @@ def init():
           CREATE INDEX IF NOT EXISTS pension_portfolio_versions_customer ON pension_portfolio_versions(customer_id,mandate,version);
           CREATE TRIGGER IF NOT EXISTS pension_portfolio_versions_no_update BEFORE UPDATE ON pension_portfolio_versions BEGIN SELECT RAISE(ABORT,'pension portfolios are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS pension_portfolio_versions_no_delete BEFORE DELETE ON pension_portfolio_versions BEGIN SELECT RAISE(ABORT,'pension portfolios are append-only'); END;''')
+        # BENCH-001 Benchmarkdefinitie: index-ID, aanbieder, return-type, valuta, hedge-status,
+        # samengestelde benchmarks met componenten/gewichten/rebalancefrequentie/geldigheidsdata. Append-only.
+        db.executescript('''CREATE TABLE IF NOT EXISTS benchmark_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          name TEXT, benchmark_type TEXT, index_id TEXT, provider TEXT, return_type TEXT NOT NULL,
+          currency TEXT, hedge_status TEXT, components TEXT, weights TEXT, rebalance_frequency TEXT,
+          valid_from TEXT, valid_to TEXT, actor TEXT NOT NULL, source_ref TEXT NOT NULL,
+          created_by TEXT, created_at TEXT NOT NULL, PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS benchmark_versions_customer ON benchmark_versions(customer_id,version);
+          CREATE TRIGGER IF NOT EXISTS benchmark_versions_no_update BEFORE UPDATE ON benchmark_versions BEGIN SELECT RAISE(ABORT,'benchmarks are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS benchmark_versions_no_delete BEFORE DELETE ON benchmark_versions BEGIN SELECT RAISE(ABORT,'benchmarks are append-only'); END;''')
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,"
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
@@ -3286,6 +3297,68 @@ def pension_portfolio_export(customer_id=None, mandate=None):
     return [{"id":r["id"],"version":r["version"],"mandate":r["mandate"],"portfolio_type":r["portfolio_type"],"coverage_ratio_indicator":r["coverage_ratio_indicator"],"hedge_ratio_indicator":r["hedge_ratio_indicator"],"created_at":r["created_at"]} for r in rows]
 
 integration_export=integration_export
+BENCHMARK_REQUIRED=["customer_id","return_type","actor","source_ref"]
+RETURN_TYPES={"total","net","price"}
+REBALANCE_FREQUENCIES={"daily","monthly","quarterly","buy-and-hold"}
+
+import json as _json
+
+def save_benchmark(data):
+    for key in BENCHMARK_REQUIRED:
+        if data.get(key) is None or str(data.get(key)).strip()=="": raise ValueError(f"missing {key}")
+    cid=data["customer_id"]
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM customers WHERE id=?",(cid,)).fetchone():
+            raise ValueError("unknown customer")
+    rt=str(data["return_type"]).strip()
+    if rt not in RETURN_TYPES: raise ValueError("invalid return_type")
+    rf=data.get("rebalance_frequency")
+    if rf is not None and str(rf).strip()!="" and str(rf).strip() not in REBALANCE_FREQUENCIES:
+        raise ValueError("invalid rebalance_frequency")
+    raw_name=data.get("name") or data.get("index_id") or "benchmark"
+    name=raw_name.strip() if isinstance(raw_name,str) else str(raw_name)
+    pid="benchmark:"+name+":"+str(cid)
+    components=data.get("components")
+    weights=data.get("weights")
+    comp_text=_json.dumps(components) if not isinstance(components,str) and components is not None else (components or None)
+    weight_text=_json.dumps(weights) if not isinstance(weights,str) and weights is not None else (weights or None)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM benchmark_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now()
+        db.execute("""INSERT INTO benchmark_versions(id,version,customer_id,name,benchmark_type,index_id,provider,return_type,currency,hedge_status,components,weights,rebalance_frequency,valid_from,valid_to,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid,version,cid,name,
+             (data.get("benchmark_type") or "").strip() or None,
+             (data.get("index_id") or "").strip() or None if isinstance(data.get("index_id"),str) else data.get("index_id"),
+             (data.get("provider") or "").strip() or None if isinstance(data.get("provider"),str) else data.get("provider"),
+             rt,
+             (data.get("currency") or "").strip() or None if isinstance(data.get("currency"),str) else data.get("currency"),
+             (data.get("hedge_status") or "").strip() or None if isinstance(data.get("hedge_status"),str) else data.get("hedge_status"),
+             comp_text, weight_text,
+             (str(rf).strip() if rf is not None and str(rf).strip()!="" else None),
+             (data.get("valid_from") or "").strip() or None if isinstance(data.get("valid_from"),str) else data.get("valid_from"),
+             (data.get("valid_to") or "").strip() or None if isinstance(data.get("valid_to"),str) else data.get("valid_to"),
+             str(data["actor"]).strip(),str(data["source_ref"]).strip(),data.get("created_by"),stamp))
+        audit(db,"benchmark",pid,"created" if version==1 else "versioned",str(data["actor"]).strip(),"benchmark",{"customer_id":cid,"version":version,"return_type":rt})
+    with connect() as db: saved=db.execute("SELECT * FROM benchmark_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def benchmarks(customer_id=None, return_type=None, index_id=None):
+    with connect() as db:
+        q="SELECT * FROM benchmark_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if return_type: q+=" AND return_type=?"; params.append(return_type)
+        if index_id: q+=" AND index_id=?"; params.append(index_id)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def benchmark_export(customer_id=None):
+    rows=benchmarks(customer_id=customer_id)
+    return [{"id":r["id"],"version":r["version"],"index_id":r["index_id"],"provider":r["provider"],"return_type":r["return_type"],"currency":r["currency"],"hedge_status":r["hedge_status"],"rebalance_frequency":r["rebalance_frequency"],"valid_from":r["valid_from"],"valid_to":r["valid_to"],"created_at":r["created_at"]} for r in rows]
+
+save_benchmark=save_benchmark
+benchmark=benchmarks
+benchmark_export=benchmark_export
 record_integration_delivery=record_integration_delivery
 save_method_profile=save_method_profile
 method_profile=method_profiles
