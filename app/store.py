@@ -615,6 +615,10 @@ def init():
         if "schema_version" not in config_columns: db.execute("ALTER TABLE config_versions ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
         change_columns={r["name"] for r in db.execute("PRAGMA table_info(change_sets)")}
         if "schema_version" not in change_columns: db.execute("ALTER TABLE change_sets ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1'")
+        # BENCH-002: bitemporele benchmarkvelden migreren (add-only, geen verwijdering).
+        bench_columns={r["name"] for r in db.execute("PRAGMA table_info(benchmark_versions)")}
+        for col in ("effective_date","history_policy","known_at","valid_from","valid_to"):
+            if col not in bench_columns: db.execute(f"ALTER TABLE benchmark_versions ADD COLUMN {col} TEXT")
         # AUD-001: audit-uitbreidingen append-only migreren (add-only, geen verwijdering).
         audit_columns={r["name"] for r in db.execute("PRAGMA table_info(audit)")}
         for col,ddl in (("old_value","TEXT"),("new_value","TEXT"),("evidence","TEXT"),("policy_version","TEXT"),("schema_version","TEXT"),("simulation","TEXT"),("approval","TEXT"),("activation","TEXT"),("publication_status","TEXT")):
@@ -3328,13 +3332,12 @@ def save_benchmark(data):
         previous=db.execute("SELECT MAX(version) version FROM benchmark_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
         version=(previous or 0)+1
         stamp=now()
-        HISTORY_POLICIES={"revise","link"}
         hp=data.get("history_policy")
         if hp is not None and str(hp).strip()!="" and str(hp).strip() not in HISTORY_POLICIES:
             raise ValueError("invalid history_policy")
         hp_val=(str(hp).strip() if hp is not None and str(hp).strip()!="" else "link")
-        eff=data.get("effective_date")
-        eff_val=(eff.strip() if isinstance(eff,str) and str(eff).strip()!="" else (data.get("valid_from").strip() if isinstance(data.get("valid_from"),str) else data.get("valid_from"))) if eff is None else (eff.strip() if isinstance(eff,str) else eff)
+        eff=data.get("effective_date") or data.get("valid_from")
+        eff_val=eff.strip() if isinstance(eff,str) and str(eff).strip()!="" else eff
         if eff_val is None or (isinstance(eff_val,str) and eff_val==""):
             eff_val=None
         known=data.get("known_at")
