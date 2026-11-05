@@ -17,6 +17,12 @@ This file migrates the former `docs/PROJECT-PLAN.md` backlog. GitHub Issues and 
 - GitHub Issues at migration: none
 - GitHub Project items at migration: none; user projects 1, 2, and 3 were empty
 - Initial migration: 2026-11-05
+- Latest sync: 2026-11-05 10:46 CET
+- Latest GitHub inventory: [issues](https://github.com/rbnbrls/client-config/issues) — 0 open, 0 closed; [Project 1](https://github.com/users/rbnbrls/projects/1), [Project 2](https://github.com/users/rbnbrls/projects/2), [Project 3](https://github.com/users/rbnbrls/projects/3) — 0 items each
+- Latest Hermes Kanban verification: local board `client-config`, 34 tasks (27 done, 6 todo, 1 triage); no GitHub-sourced tasks added
+- Sync result: no issue or Project changes; no Kanban upserts required
+
+Source snapshots: `gh issue list --repo rbnbrls/client-config --state all`; `gh project item-list 1|2|3 --owner rbnbrls`; `hermes kanban --board client-config list` at 2026-11-05 10:46 CET.
 
 ## Migrated product plan
 
@@ -359,6 +365,10 @@ De onderstaande bronnen zijn startpunten voor requirement discovery. Ze maken vo
 
 De door de aanvrager genoemde Ahold Delhaize-, Aegon AM- en ABP performance-fee-publicaties zijn klant-/marktvoorbeelden. Verifieer per implementatie de actuele brontekst, contractversie en geldigheid voordat hier controls of drempels van worden gemaakt.
 
+
+## Implementation dispatch
+
+Dispatch register: `IMPLEMENTATION-DISPATCH.md` (2026-11-05). All 62 validated features have owner, dependency state, status, branch/PR state, tests, migration notes, operational evidence, and next action. Existing local synthetic slices are not PRs; no feature is marked merged or production-ready. Repository owner must create rebased `wt/<task-id>` branches and expected PRs before review/merge. Production remains **NO-GO** pending identity/provider, authorization/RLS, encryption/secrets, retention/legal holds, restore/RTO/RPO, export publication, and unresolved platform/policy decisions.
 
 ## Completed from GitHub
 
