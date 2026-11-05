@@ -1,0 +1,15 @@
+# close-task
+timestamp:      2026-11-05T18:47:25Z
+task:           t_1865d34b
+board:          client-config
+project:        client-config
+build_dir:      /Users/ruben/Code/client-config
+branch:         main
+head:           1c5e88e
+commit_state:   committed
+push:           pushed (origin https://github.com/rbnbrls/client-config)
+local_build:    green
+build_gate_log: /Users/ruben/Code/client-config/.hermes/team/evidence/20261105T184725Z-local-gate-main.log
+acceptance_url: http://localhost:8080
+summary:        F50 landed: merge c2507c4, remote read-back c2507c4, local gate GREEN, HTTP 200 at http://localhost:8080. Reviewed SHA 68eb9de, branch wt/t_6d5ac112, worktree cleaned.
+metadata:       {"acceptance_url": "http://localhost:8080", "project": "client-config", "board": "client-config", "branch": "main", "head_sha": "1c5e88e", "commit": "1c5e88e", "commit_state": "committed", "pushed": true, "push_state": "pushed", "push_remote": "origin", "push_remote_url": "https://github.com/rbnbrls/client-config", "local_build": "green", "build_gate_log": "/Users/ruben/Code/client-config/.hermes/team/evidence/20261105T184725Z-local-gate-main.log", "build_dir": "/Users/ruben/Code/client-config"}
