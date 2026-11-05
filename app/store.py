@@ -413,6 +413,19 @@ def init():
           source_ref TEXT NOT NULL, created_at TEXT NOT NULL);
           CREATE TRIGGER IF NOT EXISTS integration_deliveries_no_update BEFORE UPDATE ON integration_deliveries BEGIN SELECT RAISE(ABORT,'integration deliveries are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS integration_deliveries_no_delete BEFORE DELETE ON integration_deliveries BEGIN SELECT RAISE(ABORT,'integration deliveries are append-only'); END;''')
+        # PERF-001 Rendementsmethodiek per mandaat: versioned, append-only method profile.
+        db.executescript('''CREATE TABLE IF NOT EXISTS method_profile_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          mandate TEXT NOT NULL, method TEXT NOT NULL, cashflow_timing TEXT NOT NULL,
+          geometric_linking INTEGER NOT NULL DEFAULT 1, gross_net_definition TEXT, fee_accrual TEXT,
+          valuation_basis TEXT, price_source_timing TEXT, base_currency TEXT, reporting_currency TEXT,
+          fx_source TEXT, fx_fixing TEXT, return_scope TEXT, derivatives_overlay_convention TEXT,
+          reporting_periods TEXT, annualisation TEXT, inception_date TEXT,
+          actor TEXT NOT NULL, source_ref TEXT NOT NULL, created_by TEXT, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS method_profile_versions_customer ON method_profile_versions(customer_id,mandate,version);
+          CREATE TRIGGER IF NOT EXISTS method_profile_versions_no_update BEFORE UPDATE ON method_profile_versions BEGIN SELECT RAISE(ABORT,'method profiles are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS method_profile_versions_no_delete BEFORE DELETE ON method_profile_versions BEGIN SELECT RAISE(ABORT,'method profiles are append-only'); END;''')
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
@@ -3100,6 +3113,7 @@ publication_status=publication_statuses
 publication_status_export=publication_status_export
 
 INTEGRATION_REQUIRED = ("customer_id","source","direction","frequency","data_owner","contract","privacy_classification","reconciliation","actor","source_ref")
+METHOD_PROFILE_REQUIRED = ("customer_id","mandate","method","cashflow_timing","actor","source_ref")
 
 def save_integration(data):
     for key in INTEGRATION_REQUIRED:
@@ -3161,6 +3175,65 @@ def integration_deliveries(customer_id=None, integration_id=None, delivery_statu
 
 save_integration=save_integration
 integration=integrations
+METHOD_PROFILE_REQUIRED=["customer_id","mandate","method","cashflow_timing","actor","source_ref"]
+METHODS_ALLOWED={"TWR","ModifiedDietz","IRR","MWR"}
+CASHFLOW_TIMINGS={"BOD","EOD"}
+
+def save_method_profile(data):
+    for key in METHOD_PROFILE_REQUIRED:
+        if data.get(key) is None or str(data.get(key)).strip()=="": raise ValueError(f"missing {key}")
+    cid=data["customer_id"]
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM customers WHERE id=?",(cid,)).fetchone():
+            raise ValueError("unknown customer")
+    mt=str(data["method"]).strip()
+    ct=str(data["cashflow_timing"]).strip()
+    if mt not in METHODS_ALLOWED: raise ValueError("invalid method")
+    if ct not in CASHFLOW_TIMINGS: raise ValueError("invalid cashflow_timing")
+    pid=str(data.get("id") or data.get("mandate")).strip() or str(data["mandate"]).strip()
+    # id per mandate
+    pid="method:"+str(data["mandate"]).strip()+":"+str(cid)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM method_profile_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now()
+        db.execute("""INSERT INTO method_profile_versions(id,version,customer_id,mandate,method,cashflow_timing,geometric_linking,gross_net_definition,fee_accrual,valuation_basis,price_source_timing,base_currency,reporting_currency,fx_source,fx_fixing,return_scope,derivatives_overlay_convention,reporting_periods,annualisation,inception_date,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid,version,cid,str(data["mandate"]).strip(),mt,ct,
+             1 if data.get("geometric_linking",True) else 0,
+             (data.get("gross_net_definition") or "").strip() or None,
+             (data.get("fee_accrual") or "").strip() or None,
+             (data.get("valuation_basis") or "").strip() or None,
+             (data.get("price_source_timing") or "").strip() or None,
+             (data.get("base_currency") or "").strip() or None,
+             (data.get("reporting_currency") or "").strip() or None,
+             (data.get("fx_source") or "").strip() or None,
+             (data.get("fx_fixing") or "").strip() or None,
+             (data.get("return_scope") or "").strip() or None,
+             (data.get("derivatives_overlay_convention") or "").strip() or None,
+             (data.get("reporting_periods") or "").strip() or None,
+             (data.get("annualisation") or "").strip() or None,
+             (data.get("inception_date") or "").strip() or None,
+             str(data["actor"]).strip(),str(data["source_ref"]).strip(),data.get("created_by"),stamp))
+        audit(db,"method_profile",pid,"created" if version==1 else "versioned",str(data["actor"]).strip(),"method profile",{"customer_id":cid,"version":version,"mandate":data["mandate"],"method":mt})
+    with connect() as db: saved=db.execute("SELECT * FROM method_profile_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def method_profiles(customer_id=None, mandate=None, method=None):
+    with connect() as db:
+        q="SELECT * FROM method_profile_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if mandate: q+=" AND mandate=?"; params.append(mandate)
+        if method: q+=" AND method=?"; params.append(method)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def method_profile_export(customer_id=None, mandate=None):
+    rows=method_profiles(customer_id=customer_id,mandate=mandate)
+    return [{"id":r["id"],"version":r["version"],"mandate":r["mandate"],"method":r["method"],"cashflow_timing":r["cashflow_timing"],"created_at":r["created_at"]} for r in rows]
+
 integration_export=integration_export
 record_integration_delivery=record_integration_delivery
+save_method_profile=save_method_profile
+method_profile=method_profiles
+method_profile_export=method_profile_export
 integration_delivery=integration_deliveries
