@@ -28,7 +28,7 @@ Source snapshots: `gh issue list --repo rbnbrls/client-config --state all`; `gh 
 
 # Projectplan — Client Service Configuration Platform
 
-**Status:** Feature 1 (domein-/legal discovery) gestart in Kanban-taak `t_3151cf55`; uitvoering via geïsoleerde worktree. Implementatie blijft geblokkeerd tot discovery en onafhankelijke review gereed zijn en vereiste menselijke besluiten zijn bevestigd. SEC-001 blijft geblokkeerd tot provider, tenant, identity-owner en deployment zijn bevestigd.  
+**Status:** Feature 1 (domein-/legal discovery) discovery baseline gereed; `DECISION-REGISTER.md` en `P0-IMPLEMENTATION-HANDOFF.md` leggen resolved versus open gates vast. Implementatie blijft geblokkeerd tot discovery-review en vereiste menselijke besluiten zijn bevestigd. SEC-001 blijft geblokkeerd tot provider, tenant, identity-owner en deployment zijn bevestigd.
 **Doel:** de klantbediening als gecontroleerde, versieerbare configuratie beheren en wijzigingen veilig simuleren, goedkeuren en publiceren.  
 **Productbasis:** huidige repository is een lokale prototype-slice. De bestaande SQLite-demo is geen production-ready control environment.
 
