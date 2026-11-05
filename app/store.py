@@ -386,6 +386,17 @@ def init():
           CREATE INDEX IF NOT EXISTS partner_profiles_versions_customer ON partner_profiles_versions(customer_id,partner_id,version);
           CREATE TRIGGER IF NOT EXISTS partner_profiles_versions_no_update BEFORE UPDATE ON partner_profiles_versions BEGIN SELECT RAISE(ABORT,'partner profiles are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS partner_profiles_versions_no_delete BEFORE DELETE ON partner_profiles_versions BEGIN SELECT RAISE(ABORT,'partner profiles are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS publication_status_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          export_id TEXT NOT NULL, checksum TEXT NOT NULL, snapshot_version TEXT NOT NULL,
+          schema_version TEXT NOT NULL, mapping_version TEXT NOT NULL, actor TEXT NOT NULL,
+          published_at TEXT NOT NULL, target TEXT NOT NULL, receipt_status TEXT NOT NULL,
+          processing_status TEXT NOT NULL, source_ref TEXT NOT NULL,
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS publication_status_versions_customer ON publication_status_versions(customer_id,export_id,version);
+          CREATE TRIGGER IF NOT EXISTS publication_status_versions_no_update BEFORE UPDATE ON publication_status_versions BEGIN SELECT RAISE(ABORT,'publication status is append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS publication_status_versions_no_delete BEFORE DELETE ON publication_status_versions BEGIN SELECT RAISE(ABORT,'publication status is append-only'); END;''')
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
@@ -3032,3 +3043,42 @@ def partner_profile_export(customer_id=None, partner_id=None, format=None):
 save_partner_profiles=save_partner_profile
 partner_profile=partner_profiles
 partner_profile_export=partner_profile_export
+PUBLICATION_STATUS_REQUIRED = ("customer_id","export_id","checksum","snapshot_version","schema_version","mapping_version","actor","published_at","target","receipt_status","processing_status","source_ref")
+
+def save_publication_status(data):
+    for key in PUBLICATION_STATUS_REQUIRED:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    pid=data.get("id") or f"pub-{data['export_id']}"
+    actor=str(data.get("actor","demo.client-service")).strip() or "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM publication_status_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO publication_status_versions(id,version,customer_id,export_id,checksum,snapshot_version,schema_version,mapping_version,actor,published_at,target,receipt_status,processing_status,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["export_id"]).strip(),str(data["checksum"]).strip(),str(data["snapshot_version"]).strip(),
+           str(data["schema_version"]).strip(),str(data["mapping_version"]).strip(),actor,str(data["published_at"]).strip(),
+           str(data["target"]).strip(),str(data["receipt_status"]).strip(),str(data["processing_status"]).strip(),
+           str(data["source_ref"]).strip(),actor,stamp))
+        audit(db,"publication_status",pid,"created" if version==1 else "versioned",actor,"publication status",{"customer_id":cid,"version":version,"export_id":data["export_id"]})
+    with connect() as db: saved=db.execute("SELECT * FROM publication_status_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def publication_statuses(customer_id=None, export_id=None, target=None, receipt_status=None):
+    with connect() as db:
+        q="SELECT * FROM publication_status_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if export_id: q+=" AND export_id=?"; params.append(export_id)
+        if target: q+=" AND target=?"; params.append(target)
+        if receipt_status: q+=" AND receipt_status=?"; params.append(receipt_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def publication_status_export(customer_id=None, export_id=None, target=None):
+    rows=publication_statuses(customer_id=customer_id,export_id=export_id,target=target)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"export_id":export_id,"target":target},"coverage":len(rows),"rows":rows}
+
+save_publication_status=save_publication_status
+publication_status=publication_statuses
+publication_status_export=publication_status_export
