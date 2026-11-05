@@ -520,6 +520,20 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS change_as_code_customer ON change_as_code(customer_id,entity_type,entity_ref,version);
             CREATE TRIGGER IF NOT EXISTS change_as_code_no_update BEFORE UPDATE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS change_as_code_no_delete BEFORE DELETE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;''')
+        # TWIN-003 Impactanalyse
+        db.executescript('''CREATE TABLE IF NOT EXISTS impact_analysis(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            baseline_ref TEXT NOT NULL, scenario_ref TEXT NOT NULL,
+            domains TEXT NOT NULL, comparison TEXT NOT NULL,
+            calc_logic_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL, source_ref TEXT NOT NULL,
+            valid_at TEXT, known_at TEXT,
+            outcome TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS impact_analysis_customer ON impact_analysis(customer_id,baseline_ref,scenario_ref,version);
+            CREATE TRIGGER IF NOT EXISTS impact_analysis_no_update BEFORE UPDATE ON impact_analysis BEGIN SELECT RAISE(ABORT,'impact analysis is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS impact_analysis_no_delete BEFORE DELETE ON impact_analysis BEGIN SELECT RAISE(ABORT,'impact analysis is append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -2907,3 +2921,56 @@ def change_as_code_export(customer_id=None, entity_type=None, entity_ref=None):
 save_change_as_codes = save_change_as_code
 change_as_codes = change_as_code
 change_as_codes_export = change_as_code_export
+
+# TWIN-003 Impactanalyse
+import json as _json2
+
+IMPACT_ANALYSIS_REQUIRED = ("customer_id","baseline_ref","scenario_ref","domains","comparison","calc_logic_version","policy_version","schema_version","source_ref")
+
+def save_impact_analysis(data):
+    for key in IMPACT_ANALYSIS_REQUIRED:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",str(s).lower()).strip("-") for s in (data["customer_id"],data["baseline_ref"],data["scenario_ref"])))
+    pid=data.get("id") or f"impact-{slug}"
+    actor=data.get("actor","demo.client-service")
+    if not str(actor).strip(): actor="demo.client-service"
+    actor=str(actor).strip()
+    stamp=now(); cid=data["customer_id"]
+    domains=data["domains"]; comparison=data["comparison"]
+    if not isinstance(domains,(dict,list,str)): raise ValueError("domains ongeldig")
+    if not isinstance(comparison,(dict,list,str)): raise ValueError("comparison ongeldig")
+    domains_json=domains if isinstance(domains,str) else _json2.dumps(domains,sort_keys=True)
+    comparison_json=comparison if isinstance(comparison,str) else _json2.dumps(comparison,sort_keys=True)
+    outcome=_json2.dumps({"domains":domains_json,"comparison":comparison_json,
+        "calc_logic_version":data["calc_logic_version"],"policy_version":data["policy_version"],
+        "schema_version":data["schema_version"]},sort_keys=True)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM impact_analysis WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO impact_analysis(id,version,customer_id,baseline_ref,scenario_ref,domains,comparison,calc_logic_version,policy_version,schema_version,source_ref,valid_at,known_at,outcome,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["baseline_ref"]).strip(),str(data["scenario_ref"]).strip(),domains_json,comparison_json,
+           str(data["calc_logic_version"]).strip(),str(data["policy_version"]).strip(),str(data["schema_version"]).strip(),str(data["source_ref"]).strip(),
+           data.get("valid_at"),data.get("known_at"),outcome,actor,stamp))
+        audit(db,"impact_analysis",pid,"created" if version==1 else "versioned",actor,"impact analysis",{"customer_id":cid,"version":version})
+    with connect() as db: saved=db.execute("SELECT * FROM impact_analysis WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def impact_analyses(customer_id=None, baseline_ref=None, scenario_ref=None):
+    with connect() as db:
+        q="SELECT * FROM impact_analysis WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if baseline_ref: q+=" AND baseline_ref=?"; params.append(baseline_ref)
+        if scenario_ref: q+=" AND scenario_ref=?"; params.append(scenario_ref)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def impact_analysis_export(customer_id=None, baseline_ref=None, scenario_ref=None):
+    rows=impact_analyses(customer_id=customer_id,baseline_ref=baseline_ref,scenario_ref=scenario_ref)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"baseline_ref":baseline_ref,"scenario_ref":scenario_ref},"coverage":len(rows),"rows":rows}
+
+# aliases
+save_impact_analyses=save_impact_analysis
+impact_analysis=impact_analyses
+impact_analysis_export=impact_analysis_export
