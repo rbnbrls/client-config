@@ -11,6 +11,13 @@ def build_version():
     if v: return v
     try:
         import subprocess
+        # Exact reviewed checkout provenance: prefer commit SHA over branch name.
+        out=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT.parent,text=True,stderr=subprocess.DEVNULL).strip()
+        if out: return out
+    except Exception:
+        pass
+    try:
+        import subprocess
         out=subprocess.check_output(["git","rev-parse","--abbrev-ref","HEAD"],cwd=ROOT.parent,text=True,stderr=subprocess.DEVNULL).strip()
         if out and out!="HEAD": return out
     except Exception:
