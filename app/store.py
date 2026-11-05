@@ -3302,7 +3302,7 @@ def pension_portfolio_export(customer_id=None, mandate=None):
     return [{"id":r["id"],"version":r["version"],"mandate":r["mandate"],"portfolio_type":r["portfolio_type"],"coverage_ratio_indicator":r["coverage_ratio_indicator"],"hedge_ratio_indicator":r["hedge_ratio_indicator"],"created_at":r["created_at"]} for r in rows]
 
 integration_export=integration_export
-BENCHMARK_REQUIRED=["customer_id","return_type","actor","source_ref"]
+BENCHMARK_REQUIRED=["customer_id","return_type","actor","source_ref","effective_date","history_policy"]
 HISTORY_POLICIES={"revise","link"}
 RETURN_TYPES={"total","net","price"}
 REBALANCE_FREQUENCIES={"daily","monthly","quarterly","buy-and-hold"}
@@ -3333,15 +3333,42 @@ def save_benchmark(data):
         version=(previous or 0)+1
         stamp=now()
         hp=data.get("history_policy")
-        if hp is not None and str(hp).strip()!="" and str(hp).strip() not in HISTORY_POLICIES:
+        if hp is None or (isinstance(hp,str) and hp.strip()==""):
+            raise ValueError("missing history_policy")
+        hp_str=str(hp).strip()
+        if hp_str not in HISTORY_POLICIES:
             raise ValueError("invalid history_policy")
-        hp_val=(str(hp).strip() if hp is not None and str(hp).strip()!="" else "link")
-        eff=data.get("effective_date") or data.get("valid_from")
-        eff_val=eff.strip() if isinstance(eff,str) and str(eff).strip()!="" else eff
-        if eff_val is None or (isinstance(eff_val,str) and eff_val==""):
-            eff_val=None
+        hp_val=hp_str
+        eff=data.get("effective_date")
+        vf=data.get("valid_from")
+        # alias/conflict validation
+        eff_str=None
+        if eff is not None and not (isinstance(eff,str) and eff.strip()==""):
+            eff_str=str(eff).strip()
+        vf_str=None
+        if vf is not None and not (isinstance(vf,str) and vf.strip()==""):
+            vf_str=str(vf).strip()
+        if eff_str is not None and vf_str is not None and eff_str!=vf_str:
+            raise ValueError("conflicting effective_date/valid_from")
+        valid_time = eff_str if eff_str is not None else vf_str
+        if valid_time is None:
+            raise ValueError("missing effective_date")
+        # validate calendar date / timestamp format
+        import datetime as _dt
+        for cand in (valid_time,):
+            try:
+                # accept date or ISO timestamp
+                if "T" in cand:
+                    _dt.datetime.fromisoformat(cand.replace("Z","+00:00"))
+                else:
+                    _dt.date.fromisoformat(cand)
+            except ValueError:
+                raise ValueError("invalid effective_date")
+        eff_val=valid_time
+        # authoritative valid_from
+        data["valid_from"]=valid_time
         known=data.get("known_at")
-        known_val=(known.strip() if isinstance(known,str) and str(known).strip()!="" else None) if known is not None else None
+        known_val=(known.strip() if isinstance(known,str) and known.strip()!="" else None) if known is not None else None
         if known_val is None:
             known_val=stamp
         db.execute("""INSERT INTO benchmark_versions(id,version,customer_id,name,benchmark_type,index_id,provider,return_type,currency,hedge_status,components,weights,rebalance_frequency,valid_from,valid_to,effective_date,history_policy,known_at,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",

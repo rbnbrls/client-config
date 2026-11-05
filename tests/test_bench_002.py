@@ -23,22 +23,23 @@ class Bench002TestCase(unittest.TestCase):
         data.update(kw)
         return store.save_benchmark(data)
 
-    def test_effective_date_defaults_to_valid_from(self):
-        r = self._save(valid_from="2026-02-01")
+    def test_effective_date_alias_valid_from(self):
+        r = self._save(valid_from="2026-02-01", effective_date="2026-02-01", history_policy="link")
         self.assertEqual(r["effective_date"], "2026-02-01")
+        self.assertEqual(r["valid_from"], "2026-02-01")
 
     def test_history_policy_validation(self):
         with self.assertRaises(ValueError):
             self._save(history_policy="bogus")
 
     def test_history_policy_revise_link(self):
-        r1 = self._save(history_policy="revise")
-        r2 = self._save(history_policy="link")
+        r1 = self._save(effective_date="2026-02-01", history_policy="revise")
+        r2 = self._save(effective_date="2026-02-02", history_policy="link")
         self.assertEqual(r1["history_policy"], "revise")
         self.assertEqual(r2["history_policy"], "link")
 
     def test_known_at_defaults_to_stamp(self):
-        r = self._save()
+        r = self._save(effective_date="2026-02-01", history_policy="link")
         self.assertTrue(r["known_at"])
 
     def test_unknown_customer(self):
@@ -50,7 +51,7 @@ class Bench002TestCase(unittest.TestCase):
             store.save_benchmark({"customer_id": "northstar"})
 
     def test_append_only_update_delete(self):
-        self._save()
+        self._save(effective_date="2026-02-01", history_policy="link")
         with store.connect() as db:
             with self.assertRaises(Exception):
                 db.execute("UPDATE benchmark_versions SET name='x'")
