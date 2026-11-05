@@ -426,6 +426,17 @@ def init():
           CREATE INDEX IF NOT EXISTS method_profile_versions_customer ON method_profile_versions(customer_id,mandate,version);
           CREATE TRIGGER IF NOT EXISTS method_profile_versions_no_update BEFORE UPDATE ON method_profile_versions BEGIN SELECT RAISE(ABORT,'method profiles are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS method_profile_versions_no_delete BEFORE DELETE ON method_profile_versions BEGIN SELECT RAISE(ABORT,'method profiles are append-only'); END;''')
+        # PERF-002 Pensioenspecifieke portefeuille-indeling: return vs matching/LDI, append-only.
+        db.executescript('''CREATE TABLE IF NOT EXISTS pension_portfolio_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          mandate TEXT NOT NULL, portfolio_type TEXT NOT NULL, swaps_overlay TEXT, hedge_return_vs_underlying TEXT,
+          liabilities_benchmark TEXT, term_structure TEXT, coverage_ratio_indicator TEXT, hedge_ratio_indicator TEXT,
+          actor TEXT NOT NULL, source_ref TEXT NOT NULL, created_by TEXT, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS pension_portfolio_versions_customer ON pension_portfolio_versions(customer_id,mandate,version);
+          CREATE TRIGGER IF NOT EXISTS pension_portfolio_versions_no_update BEFORE UPDATE ON pension_portfolio_versions BEGIN SELECT RAISE(ABORT,'pension portfolios are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS pension_portfolio_versions_no_delete BEFORE DELETE ON pension_portfolio_versions BEGIN SELECT RAISE(ABORT,'pension portfolios are append-only'); END;''')
+        # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,"
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
@@ -3231,9 +3242,55 @@ def method_profile_export(customer_id=None, mandate=None):
     rows=method_profiles(customer_id=customer_id,mandate=mandate)
     return [{"id":r["id"],"version":r["version"],"mandate":r["mandate"],"method":r["method"],"cashflow_timing":r["cashflow_timing"],"created_at":r["created_at"]} for r in rows]
 
+PENSION_PORTFOLIO_REQUIRED=["customer_id","mandate","portfolio_type","actor","source_ref"]
+PORTFOLIO_TYPES={"return","matching","LDI"}
+
+def save_pension_portfolio(data):
+    for key in PENSION_PORTFOLIO_REQUIRED:
+        if data.get(key) is None or str(data.get(key)).strip()=="": raise ValueError(f"missing {key}")
+    cid=data["customer_id"]
+    with connect() as db:
+        if not db.execute("SELECT 1 FROM customers WHERE id=?",(cid,)).fetchone():
+            raise ValueError("unknown customer")
+    pt=str(data["portfolio_type"]).strip()
+    if pt not in PORTFOLIO_TYPES: raise ValueError("invalid portfolio_type")
+    pid="portfolio:"+str(data["mandate"]).strip()+":"+pt+":"+str(cid)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM pension_portfolio_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        stamp=now()
+        db.execute("""INSERT INTO pension_portfolio_versions(id,version,customer_id,mandate,portfolio_type,swaps_overlay,hedge_return_vs_underlying,liabilities_benchmark,term_structure,coverage_ratio_indicator,hedge_ratio_indicator,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (pid,version,cid,str(data["mandate"]).strip(),pt,
+             (data.get("swaps_overlay") or "").strip() or None,
+             (data.get("hedge_return_vs_underlying") or "").strip() or None,
+             (data.get("liabilities_benchmark") or "").strip() or None,
+             (data.get("term_structure") or "").strip() or None,
+             (data.get("coverage_ratio_indicator") or "").strip() or None,
+             (data.get("hedge_ratio_indicator") or "").strip() or None,
+             str(data["actor"]).strip(),str(data["source_ref"]).strip(),data.get("created_by"),stamp))
+        audit(db,"pension_portfolio",pid,"created" if version==1 else "versioned",str(data["actor"]).strip(),"pension portfolio",{"customer_id":cid,"version":version,"mandate":data["mandate"],"portfolio_type":pt})
+    with connect() as db: saved=db.execute("SELECT * FROM pension_portfolio_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def pension_portfolios(customer_id=None, mandate=None, portfolio_type=None):
+    with connect() as db:
+        q="SELECT * FROM pension_portfolio_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if mandate: q+=" AND mandate=?"; params.append(mandate)
+        if portfolio_type: q+=" AND portfolio_type=?"; params.append(portfolio_type)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def pension_portfolio_export(customer_id=None, mandate=None):
+    rows=pension_portfolios(customer_id=customer_id,mandate=mandate)
+    return [{"id":r["id"],"version":r["version"],"mandate":r["mandate"],"portfolio_type":r["portfolio_type"],"coverage_ratio_indicator":r["coverage_ratio_indicator"],"hedge_ratio_indicator":r["hedge_ratio_indicator"],"created_at":r["created_at"]} for r in rows]
+
 integration_export=integration_export
 record_integration_delivery=record_integration_delivery
 save_method_profile=save_method_profile
 method_profile=method_profiles
 method_profile_export=method_profile_export
+save_pension_portfolio=save_pension_portfolio
+pension_portfolio=pension_portfolios
+pension_portfolio_export=pension_portfolio_export
 integration_delivery=integration_deliveries
