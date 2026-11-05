@@ -71,3 +71,11 @@ class Bench002TestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+    def test_as_of_read(self):
+        self._save(effective_date="2026-02-01", history_policy="revise", known_at="2026-02-01T00:00:00Z")
+        self._save(effective_date="2026-03-01", history_policy="link", known_at="2026-03-01T00:00:00Z")
+        before = store.benchmarks_as_of(customer_id="northstar", valid_at="2026-02-15", known_at="2026-03-15T00:00:00Z")
+        self.assertTrue(before)
+        self.assertTrue(all(r["valid_at"]=="2026-02-15" for r in before))

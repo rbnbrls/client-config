@@ -3398,6 +3398,43 @@ def benchmarks(customer_id=None, return_type=None, index_id=None):
         rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
     return [dict(r) for r in rows]
 
+def benchmarks_as_of(customer_id=None, valid_at=None, known_at=None, return_type=None, index_id=None):
+    """Return benchmark versions effective at valid_at and recorded by known_at (bitemporal read)."""
+    known_stamp = _utc_stamp(known_at or now())
+    with connect() as db:
+        q = "SELECT * FROM benchmark_versions WHERE created_at<=?"; params=[known_stamp]
+        if customer_id: q += " AND customer_id=?"; params.append(customer_id)
+        if return_type: q += " AND return_type=?"; params.append(return_type)
+        if index_id: q += " AND index_id=?"; params.append(index_id)
+        rows = db.execute(q + " ORDER BY id,version", params).fetchall()
+    grouped = {}
+    for row in rows:
+        item = dict(row)
+        vf = item.get("valid_from") or item.get("effective_date")
+        if valid_at is not None and vf is not None and vf > valid_at:
+            continue
+        if item.get("valid_to") is not None and valid_at is not None and item["valid_to"] <= valid_at:
+            continue
+        # history policy revise vs link: revise supersedes prior same id; link keeps both
+        prior = grouped.get(item["id"])
+        if prior is None:
+            grouped[item["id"]] = item
+        else:
+            if (item.get("version") or 0) > (prior.get("version") or 0):
+                if item.get("history_policy") == "revise":
+                    grouped[item["id"]] = item
+                else:
+                    # link: keep both as separate entries
+                    grouped.setdefault(item["id"] + "::" + str(item["version"]), item)
+    # flatten
+    result = []
+    for k, v in grouped.items():
+        v = dict(v)
+        v["valid_at"] = valid_at
+        v["known_at"] = known_stamp
+        result.append(v)
+    return sorted(result, key=lambda r: (r.get("id") or "", r.get("version") or 0))
+
 def benchmark_export(customer_id=None):
     rows=benchmarks(customer_id=customer_id)
     return [{"id":r["id"],"version":r["version"],"index_id":r["index_id"],"provider":r["provider"],"return_type":r["return_type"],"currency":r["currency"],"hedge_status":r["hedge_status"],"rebalance_frequency":r["rebalance_frequency"],"valid_from":r["valid_from"],"valid_to":r["valid_to"],"effective_date":r["effective_date"],"history_policy":r["history_policy"],"known_at":r["known_at"],"created_at":r["created_at"]} for r in rows]
@@ -3405,6 +3442,8 @@ def benchmark_export(customer_id=None):
 save_benchmark=save_benchmark
 benchmark=benchmarks
 benchmark_export=benchmark_export
+benchmarks_as_of=benchmarks_as_of
+benchmark_as_of=benchmarks_as_of
 record_integration_delivery=record_integration_delivery
 save_method_profile=save_method_profile
 method_profile=method_profiles
