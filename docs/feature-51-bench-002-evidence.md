@@ -1,7 +1,7 @@
 # Feature 51 — BENCH-002 evidence (R3/R4 rework)
 
 ## Candidate SHA
-- Candidate commit: 77fd7bda615252dfea2161b1ed778374ad7bf36b
+- Candidate commit: a128d6fcb85b33e7caf7f142a3e683ddfbb7749d
 - Branch: wt/t_772afb56
 
 ## R3 — Runtime provenance (build_version returns exact commit SHA)
