@@ -11,8 +11,8 @@ def build_version():
     if v: return v
     try:
         import subprocess
-        out=subprocess.check_output(["git","rev-parse","--abbrev-ref","HEAD"],cwd=ROOT.parent,text=True,stderr=subprocess.DEVNULL).strip()
-        if out and out!="HEAD": return out
+        out=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT.parent,text=True,stderr=subprocess.DEVNULL).strip()
+        if out: return out
     except Exception:
         pass
     return "unknown"

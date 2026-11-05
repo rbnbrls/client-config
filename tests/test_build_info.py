@@ -16,8 +16,9 @@ class BuildInfoTestCase(unittest.TestCase):
     def test_fallback_unknown(self):
         os.environ.pop("CLIENT_CONFIG_BUILD_VERSION", None)
         os.environ.pop("BUILD_VERSION", None)
-        # In test env git may exist; just ensure string
-        self.assertIsInstance(server.build_version(), str)
+        import subprocess
+        expected = subprocess.check_output(["git","rev-parse","HEAD"], cwd=str(Path(__file__).resolve().parents[1]), text=True).strip()
+        self.assertEqual(server.build_version(), expected)
 
     def test_endpoint(self):
         os.environ["CLIENT_CONFIG_BUILD_VERSION"] = "t_afaafd77"
