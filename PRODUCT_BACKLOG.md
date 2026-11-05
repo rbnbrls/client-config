@@ -366,10 +366,6 @@ De onderstaande bronnen zijn startpunten voor requirement discovery. Ze maken vo
 De door de aanvrager genoemde Ahold Delhaize-, Aegon AM- en ABP performance-fee-publicaties zijn klant-/marktvoorbeelden. Verifieer per implementatie de actuele brontekst, contractversie en geldigheid voordat hier controls of drempels van worden gemaakt.
 
 
-## Implementation dispatch
-
-Dispatch register: `IMPLEMENTATION-DISPATCH.md` (2026-11-05). All 62 validated features have owner, dependency state, status, branch/PR state, tests, migration notes, operational evidence, and next action. Existing local synthetic slices are not PRs; no feature is marked merged or production-ready. Repository owner must create rebased `wt/<task-id>` branches and expected PRs before review/merge. Production remains **NO-GO** pending identity/provider, authorization/RLS, encryption/secrets, retention/legal holds, restore/RTO/RPO, export publication, and unresolved platform/policy decisions.
-
 ## Completed from GitHub
 
 _No GitHub issues closed at initial migration._
