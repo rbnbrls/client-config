@@ -397,6 +397,22 @@ def init():
           CREATE INDEX IF NOT EXISTS publication_status_versions_customer ON publication_status_versions(customer_id,export_id,version);
           CREATE TRIGGER IF NOT EXISTS publication_status_versions_no_update BEFORE UPDATE ON publication_status_versions BEGIN SELECT RAISE(ABORT,'publication status is append-only'); END;
           CREATE TRIGGER IF NOT EXISTS publication_status_versions_no_delete BEFORE DELETE ON publication_status_versions BEGIN SELECT RAISE(ABORT,'publication status is append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS integration_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          source TEXT NOT NULL, direction TEXT NOT NULL, frequency TEXT NOT NULL,
+          data_owner TEXT NOT NULL, contract TEXT NOT NULL, privacy_classification TEXT NOT NULL,
+          reconciliation TEXT NOT NULL, endpoint TEXT, actor TEXT NOT NULL,
+          source_ref TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS integration_versions_customer ON integration_versions(customer_id,source,version);
+          CREATE TRIGGER IF NOT EXISTS integration_versions_no_update BEFORE UPDATE ON integration_versions BEGIN SELECT RAISE(ABORT,'integrations are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS integration_versions_no_delete BEFORE DELETE ON integration_versions BEGIN SELECT RAISE(ABORT,'integrations are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS integration_deliveries(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, integration_id TEXT NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          payload_checksum TEXT NOT NULL, delivery_status TEXT NOT NULL, actor TEXT NOT NULL,
+          source_ref TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE TRIGGER IF NOT EXISTS integration_deliveries_no_update BEFORE UPDATE ON integration_deliveries BEGIN SELECT RAISE(ABORT,'integration deliveries are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS integration_deliveries_no_delete BEFORE DELETE ON integration_deliveries BEGIN SELECT RAISE(ABORT,'integration deliveries are append-only'); END;''')
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
@@ -3082,3 +3098,69 @@ def publication_status_export(customer_id=None, export_id=None, target=None):
 save_publication_status=save_publication_status
 publication_status=publication_statuses
 publication_status_export=publication_status_export
+
+INTEGRATION_REQUIRED = ("customer_id","source","direction","frequency","data_owner","contract","privacy_classification","reconciliation","actor","source_ref")
+
+def save_integration(data):
+    for key in INTEGRATION_REQUIRED:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if data["direction"] not in {"inbound","outbound","bidirectional"}:
+        raise ValueError("direction ongeldig")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    pid=data.get("id") or f"int-{data['source'].strip().lower().replace(' ','-')}"
+    actor=str(data.get("actor","demo.client-service")).strip() or "demo.client-service"
+    stamp=now(); cid=data["customer_id"]
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM integration_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO integration_versions(id,version,customer_id,source,direction,frequency,data_owner,contract,privacy_classification,reconciliation,endpoint,actor,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["source"]).strip(),str(data["direction"]).strip(),str(data["frequency"]).strip(),
+           str(data["data_owner"]).strip(),str(data["contract"]).strip(),str(data["privacy_classification"]).strip(),
+           str(data["reconciliation"]).strip(),(data.get("endpoint") or None),actor,str(data["source_ref"]).strip(),actor,stamp))
+        audit(db,"integration",pid,"created" if version==1 else "versioned",actor,"integration",{"customer_id":cid,"version":version,"source":data["source"]})
+    with connect() as db: saved=db.execute("SELECT * FROM integration_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def integrations(customer_id=None, source=None, direction=None):
+    with connect() as db:
+        q="SELECT * FROM integration_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if source: q+=" AND source=?"; params.append(source)
+        if direction: q+=" AND direction=?"; params.append(direction)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def integration_export(customer_id=None, source=None):
+    rows=integrations(customer_id=customer_id,source=source)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"source":source},"coverage":len(rows),"rows":rows}
+
+def record_integration_delivery(data):
+    for key in ("customer_id","integration_id","payload_checksum","delivery_status","actor","source_ref"):
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if data["delivery_status"] not in {"delivered","failed","duplicate"}:
+        raise ValueError("delivery_status ongeldig")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    stamp=now()
+    with connect() as db:
+        db.execute("INSERT INTO integration_deliveries(integration_id,customer_id,payload_checksum,delivery_status,actor,source_ref,created_at) VALUES(?,?,?,?,?,?,?)",
+          (str(data["integration_id"]).strip(),data["customer_id"],str(data["payload_checksum"]).strip(),str(data["delivery_status"]).strip(),str(data["actor"]).strip(),str(data["source_ref"]).strip(),stamp))
+        audit(db,"integration_delivery",str(data["integration_id"]).strip(),"recorded",str(data["actor"]).strip(),"integration delivery",{"customer_id":data["customer_id"],"status":data["delivery_status"],"checksum":data["payload_checksum"]})
+    with connect() as db: saved=db.execute("SELECT * FROM integration_deliveries WHERE customer_id=? AND integration_id=? ORDER BY id DESC LIMIT 1",(data["customer_id"],str(data["integration_id"]).strip())).fetchone()
+    return dict(saved)
+
+def integration_deliveries(customer_id=None, integration_id=None, delivery_status=None):
+    with connect() as db:
+        q="SELECT * FROM integration_deliveries WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if integration_id: q+=" AND integration_id=?"; params.append(integration_id)
+        if delivery_status: q+=" AND delivery_status=?"; params.append(delivery_status)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+save_integration=save_integration
+integration=integrations
+integration_export=integration_export
+record_integration_delivery=record_integration_delivery
+integration_delivery=integration_deliveries
