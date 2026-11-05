@@ -16,7 +16,7 @@ Source of truth: `PRODUCT_BACKLOG.md`, `docs/discovery/feature-1-discovery-evide
 
 | ID | Decision | Status | Owner | Scope | Source | Effective | Review | Impact |
 |---|---|---|---|---|---|---|---|---|
-| D-001 | Pilot uses synthetic customer `PILOT-001`; real pilot selection stays open | PROPOSED | Customer/Mandate Owner | P0 discovery only | ADR-0012; feature-1 evidence | 2026-11-05 | 2026-12-05 | F01–F05 |
+| D-001 | Pilot uses synthetic customer `northstar` (display name `Northstar Pensioenfonds`); `PILOT-001` is not used. Real pilot selection stays open | PROPOSED | Customer/Mandate Owner | P0 discovery only | ADR-0012; feature-1 evidence | 2026-11-05 | 2026-12-05 | F01–F05 |
 | D-002 | First chain is role-level: fund → fiduciary → asset manager → submanager → custodian | PROPOSED | Customer/Mandate Owner | Synthetic topology only | ADR-0012; CFG-001 evidence | 2026-11-05 | 2026-12-05 | F01, F06–F07 |
 | D-003 | Fund, asset class, legal IDs, jurisdictions, and contract terms remain open | OPEN | Customer/Mandate Owner + Compliance | Selected pilot | ADR-0012; feature-1 evidence | — | 2026-12-05 | F01, F06, P8 |
 | D-004 | Policy records are append-only and versioned | CONFIRMED prototype | Policy Owner | Prototype register | ADR-0003; `app/store.py` | 2026-11-05 | 2026-12-05 | F02–F05 |
