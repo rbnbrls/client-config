@@ -376,6 +376,16 @@ def init():
           CREATE INDEX IF NOT EXISTS wtp_transition_profiles_customer ON wtp_transition_profiles(customer_id,fund_ref,version);
           CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_update BEFORE UPDATE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS wtp_transition_profiles_no_delete BEFORE DELETE ON wtp_transition_profiles BEGIN SELECT RAISE(ABORT,'wtp transition profiles are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS partner_profiles_versions(
+          id TEXT NOT NULL, version INTEGER NOT NULL, customer_id TEXT NOT NULL REFERENCES customers(id),
+          partner_id TEXT NOT NULL, partner_name TEXT NOT NULL, format TEXT NOT NULL,
+          mapping TEXT NOT NULL, validation TEXT NOT NULL, classification TEXT NOT NULL,
+          privacy_filter TEXT NOT NULL, schema_version TEXT NOT NULL, contract_test TEXT NOT NULL,
+          source_ref TEXT NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+          PRIMARY KEY(id,version));
+          CREATE INDEX IF NOT EXISTS partner_profiles_versions_customer ON partner_profiles_versions(customer_id,partner_id,version);
+          CREATE TRIGGER IF NOT EXISTS partner_profiles_versions_no_update BEFORE UPDATE ON partner_profiles_versions BEGIN SELECT RAISE(ABORT,'partner profiles are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS partner_profiles_versions_no_delete BEFORE DELETE ON partner_profiles_versions BEGIN SELECT RAISE(ABORT,'partner profiles are append-only'); END;''')
         # WTP-002 RACI en afhankelijkheden: partijen, taken, input/output, handoff,
           # afhankelijkheid en escalatie per fonds. Append-only versieer per id.
         db.executescript('''CREATE TABLE IF NOT EXISTS wtp_raci_dependencies(
@@ -520,6 +530,20 @@ def init():
         db.executescript('''CREATE INDEX IF NOT EXISTS change_as_code_customer ON change_as_code(customer_id,entity_type,entity_ref,version);
             CREATE TRIGGER IF NOT EXISTS change_as_code_no_update BEFORE UPDATE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;
             CREATE TRIGGER IF NOT EXISTS change_as_code_no_delete BEFORE DELETE ON change_as_code BEGIN SELECT RAISE(ABORT,'change-as-code is append-only'); END;''')
+        # TWIN-003 Impactanalyse
+        db.executescript('''CREATE TABLE IF NOT EXISTS impact_analysis(
+            id TEXT NOT NULL, version INTEGER NOT NULL,
+            customer_id TEXT NOT NULL REFERENCES customers(id),
+            baseline_ref TEXT NOT NULL, scenario_ref TEXT NOT NULL,
+            domains TEXT NOT NULL, comparison TEXT NOT NULL,
+            calc_logic_version TEXT NOT NULL, policy_version TEXT NOT NULL,
+            schema_version TEXT NOT NULL, source_ref TEXT NOT NULL,
+            valid_at TEXT, known_at TEXT,
+            outcome TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY(id,version));''')
+        db.executescript('''CREATE INDEX IF NOT EXISTS impact_analysis_customer ON impact_analysis(customer_id,baseline_ref,scenario_ref,version);
+            CREATE TRIGGER IF NOT EXISTS impact_analysis_no_update BEFORE UPDATE ON impact_analysis BEGIN SELECT RAISE(ABORT,'impact analysis is append-only'); END;
+            CREATE TRIGGER IF NOT EXISTS impact_analysis_no_delete BEFORE DELETE ON impact_analysis BEGIN SELECT RAISE(ABORT,'impact analysis is append-only'); END;''')
 
         dora_columns={r["name"] for r in db.execute("PRAGMA table_info(dora_assessments)")}
         if "effective_from" not in dora_columns: db.execute("ALTER TABLE dora_assessments ADD COLUMN effective_from TEXT")
@@ -2907,3 +2931,104 @@ def change_as_code_export(customer_id=None, entity_type=None, entity_ref=None):
 save_change_as_codes = save_change_as_code
 change_as_codes = change_as_code
 change_as_codes_export = change_as_code_export
+
+# TWIN-003 Impactanalyse
+import json as _json2
+
+IMPACT_ANALYSIS_REQUIRED = ("customer_id","baseline_ref","scenario_ref","domains","comparison","calc_logic_version","policy_version","schema_version","source_ref")
+
+def save_impact_analysis(data):
+    for key in IMPACT_ANALYSIS_REQUIRED:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    slug="-".join((re.sub(r"[^a-z0-9]+","-",str(s).lower()).strip("-") for s in (data["customer_id"],data["baseline_ref"],data["scenario_ref"])))
+    pid=data.get("id") or f"impact-{slug}"
+    actor=data.get("actor","demo.client-service")
+    if not str(actor).strip(): actor="demo.client-service"
+    actor=str(actor).strip()
+    stamp=now(); cid=data["customer_id"]
+    domains=data["domains"]; comparison=data["comparison"]
+    if not isinstance(domains,(dict,list,str)): raise ValueError("domains ongeldig")
+    if not isinstance(comparison,(dict,list,str)): raise ValueError("comparison ongeldig")
+    domains_json=domains if isinstance(domains,str) else _json2.dumps(domains,sort_keys=True)
+    comparison_json=comparison if isinstance(comparison,str) else _json2.dumps(comparison,sort_keys=True)
+    outcome=_json2.dumps({"domains":domains_json,"comparison":comparison_json,
+        "calc_logic_version":data["calc_logic_version"],"policy_version":data["policy_version"],
+        "schema_version":data["schema_version"]},sort_keys=True)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM impact_analysis WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO impact_analysis(id,version,customer_id,baseline_ref,scenario_ref,domains,comparison,calc_logic_version,policy_version,schema_version,source_ref,valid_at,known_at,outcome,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["baseline_ref"]).strip(),str(data["scenario_ref"]).strip(),domains_json,comparison_json,
+           str(data["calc_logic_version"]).strip(),str(data["policy_version"]).strip(),str(data["schema_version"]).strip(),str(data["source_ref"]).strip(),
+           data.get("valid_at"),data.get("known_at"),outcome,actor,stamp))
+        audit(db,"impact_analysis",pid,"created" if version==1 else "versioned",actor,"impact analysis",{"customer_id":cid,"version":version})
+    with connect() as db: saved=db.execute("SELECT * FROM impact_analysis WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def impact_analyses(customer_id=None, baseline_ref=None, scenario_ref=None):
+    with connect() as db:
+        q="SELECT * FROM impact_analysis WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if baseline_ref: q+=" AND baseline_ref=?"; params.append(baseline_ref)
+        if scenario_ref: q+=" AND scenario_ref=?"; params.append(scenario_ref)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def impact_analysis_export(customer_id=None, baseline_ref=None, scenario_ref=None):
+    rows=impact_analyses(customer_id=customer_id,baseline_ref=baseline_ref,scenario_ref=scenario_ref)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"baseline_ref":baseline_ref,"scenario_ref":scenario_ref},"coverage":len(rows),"rows":rows}
+
+# aliases
+save_impact_analyses=save_impact_analysis
+impact_analysis=impact_analyses
+impact_analysis_export=impact_analysis_export
+
+# EXP-001 Partnerprofielen (versioned mapping, validation, privacy filter, contract tests)
+PARTNER_PROFILE_REQUIRED = ("customer_id","partner_id","partner_name","format","mapping","validation","classification","privacy_filter","schema_version","source_ref")
+
+def save_partner_profile(data):
+    for key in PARTNER_PROFILE_REQUIRED:
+        if data.get(key) is None or (isinstance(data[key],str) and not data[key].strip()):
+            raise ValueError(f"{key} is verplicht")
+    if not customer(data["customer_id"]): raise ValueError("Klant niet gevonden")
+    pid=data.get("id") or f"partner-{data['partner_id']}"
+    actor=data.get("actor","demo.client-service")
+    if not str(actor).strip(): actor="demo.client-service"
+    actor=str(actor).strip()
+    stamp=now(); cid=data["customer_id"]
+    import json as _jp
+    mapping=data["mapping"]; validation=data["validation"]; contract=data.get("contract_test",{})
+    if not isinstance(mapping,(dict,list,str)): raise ValueError("mapping ongeldig")
+    if not isinstance(validation,(dict,list,str)): raise ValueError("validation ongeldig")
+    mapping_json=mapping if isinstance(mapping,str) else _jp.dumps(mapping,sort_keys=True)
+    validation_json=validation if isinstance(validation,str) else _jp.dumps(validation,sort_keys=True)
+    contract_json=contract if isinstance(contract,str) else _jp.dumps(contract,sort_keys=True)
+    outcome=_jp.dumps({"mapping":mapping_json,"validation":validation_json,"classification":data["classification"],"privacy_filter":data["privacy_filter"],"schema_version":data["schema_version"]},sort_keys=True)
+    with connect() as db:
+        previous=db.execute("SELECT MAX(version) version FROM partner_profiles_versions WHERE id=? AND customer_id=?",(pid,cid)).fetchone()["version"]
+        version=(previous or 0)+1
+        db.execute("""INSERT INTO partner_profiles_versions(id,version,customer_id,partner_id,partner_name,format,mapping,validation,classification,privacy_filter,schema_version,contract_test,source_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+          (pid,version,cid,str(data["partner_id"]).strip(),str(data["partner_name"]).strip(),str(data["format"]).strip(),mapping_json,validation_json,
+           str(data["classification"]).strip(),str(data["privacy_filter"]).strip(),str(data["schema_version"]).strip(),contract_json,str(data["source_ref"]).strip(),actor,stamp))
+        audit(db,"partner_profiles",pid,"created" if version==1 else "versioned",actor,"partner profile",{"customer_id":cid,"version":version})
+    with connect() as db: saved=db.execute("SELECT * FROM partner_profiles_versions WHERE id=? AND customer_id=? ORDER BY version DESC LIMIT 1",(pid,cid)).fetchone()
+    return dict(saved)
+
+def partner_profiles(customer_id=None, partner_id=None, format=None):
+    with connect() as db:
+        q="SELECT * FROM partner_profiles_versions WHERE 1=1"; params=[]
+        if customer_id: q+=" AND customer_id=?"; params.append(customer_id)
+        if partner_id: q+=" AND partner_id=?"; params.append(partner_id)
+        if format: q+=" AND format=?"; params.append(format)
+        rows=db.execute(q+" ORDER BY created_at DESC",params).fetchall()
+    return [dict(r) for r in rows]
+
+def partner_profile_export(customer_id=None, partner_id=None, format=None):
+    rows=partner_profiles(customer_id=customer_id,partner_id=partner_id,format=format)
+    return {"generated_at":now(),"perimeter":{"customer_id":customer_id,"partner_id":partner_id,"format":format},"coverage":len(rows),"rows":rows}
+
+save_partner_profiles=save_partner_profile
+partner_profile=partner_profiles
+partner_profile_export=partner_profile_export
