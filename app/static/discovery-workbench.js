@@ -16,11 +16,56 @@
   document.head.appendChild(style);
 
   const nav = document.querySelector('.sidebar');
-  if (!nav || document.getElementById('f01DiscoveryButton')) return;
-  const button = document.createElement('button');
-  button.id = 'f01DiscoveryButton'; button.className = 'nav-item'; button.type = 'button';
-  button.innerHTML = '<span class="ico">◎</span> F01 Discovery <span class="identity-state">P0</span>';
-  nav.insertBefore(button, nav.querySelector('.nav-label[style]') || null);
+  if (!nav) return;
+  nav.setAttribute('role', 'navigation');
+  nav.setAttribute('aria-label', 'Volledige klantbediening');
+  const brandSubline = nav.querySelector('.brand small');
+  if (brandSubline) brandSubline.textContent = 'Klantbediening';
+  const sourceItems = [...nav.querySelectorAll('.nav-item')];
+  const itemByIndex = (index, label, role, icon, action) => {
+    const item = sourceItems[index] || document.createElement('button');
+    item.className = 'nav-item'; item.type = 'button'; item.innerHTML = `<span class="ico">${icon}</span><span class="nav-item-label">${label}</span><span class="nav-role">${role}</span>`;
+    if (index === 0) { item.classList.add('active'); item.setAttribute('aria-current', 'page'); }
+    if (action) item.onclick = action;
+    return item;
+  };
+  const futureItem = (label, role, icon, message, action) => {
+    const item = document.createElement('button'); item.className = 'nav-item nav-item-roadmap'; item.type = 'button'; item.innerHTML = `<span class="ico">${icon}</span><span class="nav-item-label">${label}</span><span class="nav-role">${role}</span>`;
+    item.onclick = action || (() => window.showToast?.(message));
+    return item;
+  };
+  const items = [
+    {group:'PROSPECT & SALES', entries:[
+      futureItem('Prospectdossier', 'Sales', '◌', 'Prospectdossier is als workflow-slice gepland.'),
+      futureItem('Voorstel & prijs', 'Sales · Fee', '€', 'Voorstel & prijs is als workflow-slice gepland.')
+    ]},
+    {group:'ONBOARDEN ALS KLANT', entries:[
+      itemByIndex(1, 'Klantdossier', 'Accountmanager', '◉', () => scrollToSection('customers')),
+      itemByIndex(3, 'Afspraken & vereisten', 'Accountmanager · Legal', '▧'),
+      itemByIndex(5, 'Keten & partijen', 'Operations · Risk', '⌘'),
+      itemByIndex(4, 'Uitbesteding & risico', 'Risk · Compliance', '◈'),
+      itemByIndex(6, 'Beleid & afspraken', 'Compliance · Legal', '◇')
+    ]},
+    {group:'DAGELIJKSE KLANTBEDIENING', entries:[
+      itemByIndex(0, 'Klantoverzicht', 'Accountmanager', '▦'),
+      itemByIndex(2, 'Wijzigingen beheren', 'Accountmanager · Operations', '⇄'),
+      itemByIndex(9, 'Review & audit', 'Reviewer · Risk', '▤'),
+      itemByIndex(10, 'Exports delen', 'Operations · Partner', '⇧')
+    ]},
+    {group:'PLATFORM & GOVERNANCE', entries:[
+      itemByIndex(7, 'Identiteit & toegang', 'Platform · Security', '◉', () => openIdentityReadiness()),
+      itemByIndex(8, 'Schema & parameters', 'Platform · Data', '⌗', () => openConfigurationSchemas()),
+      futureItem('Pilot & open besluiten', 'Product · Legal', '◎', '', () => openDiscovery())
+    ]}
+  ];
+  const firstLabel = nav.querySelector('.nav-label');
+  [...nav.querySelectorAll('.nav-label')].forEach((label) => label.remove());
+  const sideBottom = nav.querySelector('.side-bottom');
+  const environmentLabel = sideBottom?.querySelector('span[style*="color:#6e929d"]');
+  if (environmentLabel) environmentLabel.textContent = 'Alle personas · MVP';
+  [...nav.querySelectorAll('.nav-item')].forEach((item) => item.remove());
+  const makeLabel = (text) => { const element = document.createElement('div'); element.className = 'nav-label nav-label-spaced'; element.textContent = text; return element; };
+  if (sideBottom) items.forEach((section) => { nav.insertBefore(makeLabel(section.group), sideBottom); section.entries.forEach((item) => nav.insertBefore(item, sideBottom)); });
 
   const modal = document.createElement('div');
   modal.className = 'f01-modal'; modal.id = 'f01DiscoveryModal';
@@ -39,13 +84,21 @@
   async function load() { content.textContent = 'Discovery laden…'; try { render(await api('/api/v1/discovery')); } catch (error) { content.textContent = error.message; } }
   async function saveDecision(event) { event.preventDefault(); const form = event.currentTarget; const error = form.querySelector('#f01Error'); error.textContent = ''; const data = {decision_key: form.querySelector('#f01Key').value, status: form.querySelector('#f01Status').value, decision: form.querySelector('#f01Decision').value, owner: form.querySelector('#f01Owner').value, actor: form.querySelector('#f01Actor').value, rationale: form.querySelector('#f01Rationale').value}; try { await api('/api/v1/discovery/decisions', {method:'POST', body:JSON.stringify(data)}); await load(); } catch (err) { error.textContent = err.message; } }
   function close() { modal.classList.remove('open'); }
-  button.addEventListener('click', () => { modal.classList.add('open'); load(); });
+  const openDiscovery = () => { modal.classList.add('open'); load(); };
   const heading = document.querySelector('.heading');
+  const crumb = document.querySelector('.crumb');
+  if (crumb) crumb.innerHTML = 'Klantbediening <span style="padding:0 8px;color:#b4c0c4">/</span><b>Werkbank</b>';
+  const eyebrow = document.querySelector('.heading .eyebrow');
+  const title = document.querySelector('.heading h1');
+  const subtitle = document.querySelector('.heading p');
+  if (eyebrow) eyebrow.textContent = 'CLIENT CONFIGURATION · VOLLEDIGE KLANTBEDIENING';
+  if (title) title.textContent = 'Klantbediening';
+  if (subtitle) subtitle.textContent = 'Werk samen aan prospect, sales, onboarding en dagelijkse bediening van institutionele klanten.';
   if (heading) {
-    const launch = button.cloneNode(true);
-    launch.id = 'f01DiscoveryLaunch'; launch.className = 'btn primary'; launch.innerHTML = '◎ F01 Discovery';
+    const launch = document.createElement('button');
+    launch.id = 'f01DiscoveryLaunch'; launch.className = 'btn primary'; launch.innerHTML = '◎ Pilot & open besluiten';
     heading.appendChild(launch);
-    launch.addEventListener('click', () => { modal.classList.add('open'); load(); });
+    launch.addEventListener('click', openDiscovery);
   }
   modal.querySelector('.f01-close').addEventListener('click', close); modal.querySelector('#f01CloseBottom').addEventListener('click', close);
   modal.addEventListener('click', (event) => { if (event.target === modal) close(); });

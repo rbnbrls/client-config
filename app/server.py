@@ -156,9 +156,10 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/":
                 raw=(ROOT/"static"/"index.html").read_bytes()
                 addon=(ROOT/"static"/"discovery-workbench.js").read_text()
+                workflow=(ROOT/"static"/"workflow-pages.js").read_text()
                 theme=(ROOT/"static"/"institutional-theme.css").read_text()
                 raw=raw.replace(b"</head>", ("<style>"+theme+"</style></head>").encode())
-                raw=raw.replace(b"</body>", ("<script>"+addon+"</script></body>").encode())
+                raw=raw.replace(b"</body>", ("<script>"+addon+"</script><script>"+workflow+"</script></body>").encode())
                 self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             file=ROOT/"static"/("index.html" if path=="/" else path.removeprefix("/"))
             if not file.resolve().is_relative_to((ROOT/"static").resolve()) or not file.is_file():return self.send_json({"error":"not_found"},404)
