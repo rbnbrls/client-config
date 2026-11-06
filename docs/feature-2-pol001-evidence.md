@@ -45,3 +45,11 @@ SEC-001-identiteit (ADR-0005, extern geblokkeerd); PostgreSQL-migratie (latere P
 - Geen secrets/keys in diff (gescand); alleen synthetische actoren en bronnen.
 - Geen user-touched bestanden aangeraakt (AGENTS.md, app/server.py, app/static/index.html, docs/SEC-001-UI-DESIGN-NOTES.md, docs/adr/0005-*): `git status` toont uitsluitend `app/store.py` (+37) en nieuwe `tests/`.
 - Geen hard deletes; alle registers append-only via triggers.
+
+## Current-base verification (2026-11-06)
+
+- Baseline: `3dc5944112ff2ebc98526f1e1f8e2bf0bd535fc1` (`main`).
+- Focused command: `python3 -m unittest tests.test_policy_register -v` — 10/10 OK, exit 0.
+- `git diff --check main...HEAD` — PASS; no working-tree changes before this evidence update.
+- Scope check: POL-001 implementation already exists in `app/store.py`, `tests/test_policy_register.py` and this evidence file; no duplicate runtime code added.
+- ResourceWarning messages from existing SQLite connection cleanup appeared during tests; they did not fail tests and remain outside POL-001 scope.
