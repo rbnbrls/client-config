@@ -53,6 +53,14 @@ def init():
           CREATE INDEX IF NOT EXISTS policy_code_version ON policy_controls(control_code,version);
           CREATE TRIGGER IF NOT EXISTS policy_controls_no_update BEFORE UPDATE ON policy_controls BEGIN SELECT RAISE(ABORT,'policy controls are append-only'); END;
           CREATE TRIGGER IF NOT EXISTS policy_controls_no_delete BEFORE DELETE ON policy_controls BEGIN SELECT RAISE(ABORT,'policy controls are append-only'); END;''')
+        db.executescript('''CREATE TABLE IF NOT EXISTS discovery_decisions(
+          id TEXT NOT NULL, decision_key TEXT NOT NULL, version INTEGER NOT NULL,
+          status TEXT NOT NULL, decision TEXT NOT NULL, owner TEXT NOT NULL,
+          rationale TEXT NOT NULL, actor TEXT NOT NULL, recorded_at TEXT NOT NULL,
+          PRIMARY KEY(decision_key,version));
+          CREATE INDEX IF NOT EXISTS discovery_decision_latest ON discovery_decisions(decision_key,version);
+          CREATE TRIGGER IF NOT EXISTS discovery_decisions_no_update BEFORE UPDATE ON discovery_decisions BEGIN SELECT RAISE(ABORT,'discovery decisions are append-only'); END;
+          CREATE TRIGGER IF NOT EXISTS discovery_decisions_no_delete BEFORE DELETE ON discovery_decisions BEGIN SELECT RAISE(ABORT,'discovery decisions are append-only'); END;''')
         db.executescript('''CREATE TABLE IF NOT EXISTS policy_source_reviews(
           id TEXT PRIMARY KEY, control_code TEXT NOT NULL, policy_version INTEGER NOT NULL,
           source_kind TEXT NOT NULL, source_title TEXT NOT NULL, source_locator TEXT NOT NULL,
@@ -843,6 +851,74 @@ def audit_log(limit=100):
                 except ValueError: pass
         out.append(row)
     return out
+
+def discovery_catalog():
+    """Return the F01 discovery baseline without implying legal confirmation."""
+    return {
+        "pilot": {
+            "id": "northstar",
+            "name": "Northstar Pensioenfonds (synthetisch)",
+            "profile": "Multi-asset · Synthetic Global 60/40 · EUR · Advisory",
+            "status": "open",
+            "owner": "Klant-/mandaat-eigenaar + Compliance",
+            "note": "Pilotklant, asset class en partnerprofiel moeten door menselijke eigenaren worden bevestigd.",
+        },
+        "chain": [
+            {"role": "Fiduciair", "name": "Northstar Fiduciair (synthetisch)", "service": "FIDUCIARY"},
+            {"role": "Vermogensbeheerder", "name": "Northstar Asset Manager (synthetisch)", "service": "MANAGEMENT"},
+            {"role": "Submanager", "name": "Submanager A (synthetisch)", "service": "DELEGATED_MANAGEMENT"},
+            {"role": "Custodian", "name": "Northstar Custodian (synthetisch)", "service": "CUSTODY"},
+        ],
+        "data_dictionary": [
+            {"domain": "Klant & configuratie", "source": "customers · config_versions", "versioning": "append-only + valid/transaction time", "status": "prototype"},
+            {"domain": "Keten", "source": "client_entities · client_relationships", "versioning": "append-only + snapshots", "status": "prototype"},
+            {"domain": "Klantvereisten", "source": "client_requirements", "versioning": "per klant/vereiste", "status": "taxonomie open"},
+            {"domain": "Controls & DORA", "source": "policy_controls · dora_assessments", "versioning": "append-only + review", "status": "legal scope open"},
+            {"domain": "Audit & export", "source": "audit · exports · partner_profiles", "versioning": "append-only / schema-versioned", "status": "prototype"},
+        ],
+        "policy_owners": [
+            {"code": "CLIENT-PAI-DATA", "title": "PAI-data-aanlevering per mandaat", "owner": "Compliance (te bevestigen)", "status": "open"},
+            {"code": "WTP-TRANSITION-DATA", "title": "Wtp-transitiedata en mijlpalen", "owner": "Client Service (te bevestigen)", "status": "open"},
+            {"code": "ICT-DORA-SCOPE", "title": "Classificatie ICT- en vermogensbeheerdienst", "owner": "Compliance (te bevestigen)", "status": "open"},
+        ],
+        "adr_decisions": [
+            {"id": "ADR-0002", "title": "DORA assessment valid time", "owner": "Compliance/Legal + ICT-risk", "open": "Scope- en kritikaliteitscriteria per dienst en klant"},
+            {"id": "ADR-0003", "title": "Policy valid time", "owner": "Control-eigenaar + Compliance/Legal", "open": "Handhavingsdrempels, uitzonderingsproces en reviewcadans"},
+            {"id": "ADR-0004", "title": "Versioned configuration schemas", "owner": "Domeineigenaars per parameter", "open": "Schema-eigenaren en klant-/mandaatnormen"},
+            {"id": "ADR-0005", "title": "Identity & SSO foundation", "owner": "Platform/Identity Owner", "open": "Provider, tenant, appregistratie, secrets en claimmapping"},
+        ],
+    }
+
+def discovery_decisions(decision_key=None):
+    query = "SELECT * FROM discovery_decisions"
+    args = []
+    if decision_key:
+        query += " WHERE decision_key=?"
+        args.append(decision_key)
+    query += " ORDER BY recorded_at DESC, version DESC"
+    with connect() as db:
+        return [dict(row) for row in db.execute(query, args).fetchall()]
+
+def save_discovery_decision(data):
+    required = ("decision_key", "status", "decision", "owner", "rationale", "actor")
+    for key in required:
+        if not str(data.get(key, "")).strip():
+            raise ValueError(f"{key} is verplicht")
+    if data["status"] not in {"open", "confirmed", "blocked"}:
+        raise ValueError("status moet open, confirmed of blocked zijn")
+    key = data["decision_key"].strip()
+    with connect() as db:
+        previous = db.execute("SELECT MAX(version) AS version FROM discovery_decisions WHERE decision_key=?", (key,)).fetchone()["version"]
+        version = (previous or 0) + 1
+        item = {
+            "id": str(uuid.uuid4()), "decision_key": key, "version": version,
+            "status": data["status"], "decision": data["decision"].strip(),
+            "owner": data["owner"].strip(), "rationale": data["rationale"].strip(),
+            "actor": data["actor"].strip(), "recorded_at": now(),
+        }
+        db.execute("INSERT INTO discovery_decisions VALUES(?,?,?,?,?,?,?,?,?)", tuple(item.values()))
+        audit(db, "discovery_decision", item["id"], "recorded", item["actor"], item["rationale"], item, new_value=item, evidence="F01 discovery workbench")
+    return item
 
 def _config_value(payload,path):
     if not path:return None

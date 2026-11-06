@@ -36,6 +36,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if path=="/api/health":return self.send_json({"status":"ok","service":"client-config-mvp"})
             if path=="/api/v1/build-info":return self.send_json({"build_id":build_version()})
+            if path=="/api/v1/discovery":return self.send_json({"catalog":store.discovery_catalog(),"decisions":store.discovery_decisions()})
             if path=="/api/v1/config-schemas":return self.send_json(store.configuration_schemas())
             schema_match=re.fullmatch(r"/api/v1/config-schemas/(\d+)",path)
             if schema_match:
@@ -152,6 +153,13 @@ class Handler(BaseHTTPRequestHandler):
                 with store.connect() as db: row=db.execute("SELECT * FROM exports WHERE id=?",(m.group(1),)).fetchone()
                 if not row:return self.send_json({"error":"not_found"},404)
                 row=dict(row); row["payload"]=json.loads(row["payload"]); return self.send_json(row)
+            if path=="/":
+                raw=(ROOT/"static"/"index.html").read_bytes()
+                addon=(ROOT/"static"/"discovery-workbench.js").read_text()
+                theme=(ROOT/"static"/"institutional-theme.css").read_text()
+                raw=raw.replace(b"</head>", ("<style>"+theme+"</style></head>").encode())
+                raw=raw.replace(b"</body>", ("<script>"+addon+"</script></body>").encode())
+                self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             file=ROOT/"static"/("index.html" if path=="/" else path.removeprefix("/"))
             if not file.resolve().is_relative_to((ROOT/"static").resolve()) or not file.is_file():return self.send_json({"error":"not_found"},404)
             raw=file.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8" if file.suffix==".html" else "text/plain; charset=utf-8"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
@@ -175,6 +183,8 @@ class Handler(BaseHTTPRequestHandler):
                 result=store.validate_configuration(configuration,version)
                 store.audit_configuration_validation(configuration,result,actor,reason)
                 return self.send_json(result)
+            if path=="/api/v1/discovery/decisions":
+                return self.send_json(store.save_discovery_decision(data),201)
             if path=="/api/client-requirements":return self.send_json(store.save_client_requirement(data),201)
             if path=="/api/dora-assessments":return self.send_json(store.save_dora_assessment(data),201)
             if path=="/api/activities":
